@@ -1,0 +1,86 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+.eggs/
+develop-eggs/
+sdist/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ===== Pytest & Coverage =====
+.pytest_cache/
+.cache
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# ===== C / C++ / CUDA Build Artifacts =====
+# Compiled Object files
+*.o
+*.obj
+*.ko
+*.mod
+*.smod
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.dylib
+*.dll
+*.so.*
+
+# Compiled Static libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# CUDA specific
+*.cu.o
+*.cubin
+*.fatbin
+*.ptx
+
+# ===== IDEs & Editors =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Logs & Databases =====
+*.log
+*.sqlite
+*.db
+
+# ===== Project specific (Images, Results, Configs) =====
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+
+.env
+config_local.ini
