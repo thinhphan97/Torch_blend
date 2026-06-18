@@ -5,7 +5,8 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 
 ## ✨ Features
 
-- **Zero-copy Tensor Operations**: Directly accesses PyTorch tensor memory pointers for maximum performance.
+- **Multi-Dtype Support**: Natively supports `uint8`, `float32`, and `float16` tensors. Automatically normalizes mask values based on dtype (255 for uint8, 1.0 for floats).
+- **Zero-copy Tensor Operations**: Directly accesses PyTorch tensor memory pointers for maximum performance using PyTorch's `AT_DISPATCH` macros.
 - **Auto Sync/Async**: Automatically runs synchronously if no stream is provided, and asynchronously if a `torch.cuda.Stream` is provided.
 - **Device-Aware**: Falls back to a pure C++ CPU loop if tensors are on CPU, with friendly warnings if streams are misused.
 - **Pythonic API**: Comes with a clean, typed Python wrapper with full docstrings and IDE autocomplete support.
@@ -25,7 +26,7 @@ torch_blend_package/
 └── tests/                   # Unit tests
     ├── __init__.py
     ├── conftest.py          # Pytest fixtures
-    └── test_blend.py        # Test cases
+    └── test_blend.py        # Test cases (including Multi-Dtype tests)
 ```
 
 ## 🛠️ Installation & Build
@@ -54,10 +55,7 @@ pip install setuptools wheel pytest ninja
 Verify that `nvcc` and PyTorch CUDA versions match:
 ```bash
 nvcc --version
-# Should show release 12.1
-
 python -c "import torch; print(torch.version.cuda)"
-# Should show 12.1
 ```
 
 ### 2. Building the Package
@@ -68,8 +66,8 @@ Clone the repository and build the extension. You have two options to build:
 Compiles the `.cu` file and drops the `.so` library right next to your source code. Best for active development.
 
 ```bash
-git clone https://github.com/thinhphan97/Torch_Blend.git
-cd torch_blend_package
+git clone https://github.com/thinhphan97/Torch_blend.git
+cd Torch_blend
 
 # Build the extension in-place
 python setup.py build_ext --inplace
@@ -79,8 +77,8 @@ python setup.py build_ext --inplace
 Compiles the code and packages it into a distributable `.whl` file located in the `dist/` folder.
 
 ```bash
-git clone https://github.com/thinhphan97/Torch_Blend.git
-cd torch_blend_package
+git clone https://github.com/thinhphan97/Torch_blend.git
+cd Torch_blend
 
 # Build the wheel package
 python setup.py bdist_wheel
@@ -91,18 +89,16 @@ pip install dist/torch_blend-*.whl
 
 ## 🧪 Running Tests
 
-The project includes a comprehensive `pytest` suite to verify mathematical correctness, async/sync behaviors, and input validation.
+The project includes a comprehensive `pytest` suite to verify mathematical correctness, async/sync behaviors, multi-dtype support, and input validation.
 
 ```bash
 pytest tests/ -v
 ```
 
-*If all tests pass, you should see `10 passed`.*
-
 ## 🚀 Usage & Examples
 
-### Synchronous Blending (Default)
-By default, the function blocks the CPU until the GPU finishes processing. This is ideal for simple scripts where you need the result immediately.
+### 1. Standard Image Blending (uint8 - OpenCV Style)
+By default, the function blocks the CPU until the GPU finishes processing. This is ideal for image processing scripts.
 
 ```python
 import torch
@@ -114,46 +110,43 @@ img1_cv = cv2.imread("image1.jpg")
 img2_cv = cv2.imread("image2.jpg")
 mask_cv = cv2.imread("mask.png", cv2.IMREAD_GRAYSCALE)
 
-# Move to GPU (or keep on CPU, the package handles both)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 img1 = torch.from_numpy(img1_cv).to(device)
 img2 = torch.from_numpy(img2_cv).to(device)
 mask = torch.from_numpy(mask_cv).to(device)
 
-# Synchronous Blend (Blocks until GPU finishes)
+# Synchronous Blend
 result = ImageBlender.blend(img1, img2, mask)
 
-# Save result
 cv2.imwrite("result_sync.jpg", result.cpu().numpy())
 ```
 
-### Asynchronous Blending (Custom Stream)
-For high-performance pipelines, you can pass a custom `torch.cuda.Stream`. The function will return immediately, allowing you to overlap CPU computation with GPU processing.
+### 2. Deep Learning Pipeline (float32 / float16)
+Tensors are automatically normalized. If you pass `float32` or `float16` tensors, the mask is expected to be in the `[0.0, 1.0]` range.
 
 ```python
 import torch
 from torch_blend import ImageBlender
 
-# ... (load tensors as above) ...
+# Assume img1, img2, mask are float32 tensors in range [0.0, 1.0]
+# Shape: (H, W, C) or (H, W, 1) -> (H, W) for mask
 
-# Create a custom stream
+# Asynchronous Blend on GPU using float16 (half precision) for speed
 my_stream = torch.cuda.Stream()
 
 with torch.cuda.stream(my_stream):
-    # Asynchronous Blend: Returns immediately, GPU works in the background
-    result_async = ImageBlender.blend(img1, img2, mask, stream=my_stream)
+    # Returns immediately, GPU works in the background
+    result_async = ImageBlender.blend(img1.half().cuda(), 
+                                      img2.half().cuda(), 
+                                      mask.half().cuda(), 
+                                      stream=my_stream)
 
-# Do heavy CPU work here while the GPU is blending...
-# _ = sum(range(10000000))
-
-# Explicitly wait for the GPU to finish when you need the result
+# Explicitly wait for the GPU to finish
 my_stream.synchronize()
-
-print("Async blend complete!")
 ```
 
-### CPU Fallback & Warnings
+### 3. CPU Fallback & Warnings
 If you pass a stream but the tensors are on the CPU, the package will not crash. It will issue a `RuntimeWarning` and safely ignore the stream.
 
 ```python
@@ -161,7 +154,6 @@ import warnings
 import torch
 from torch_blend import ImageBlender
 
-# CPU Tensors
 img1 = torch.randint(0, 255, (64, 64, 3), dtype=torch.uint8)
 img2 = torch.randint(0, 255, (64, 64, 3), dtype=torch.uint8)
 mask = torch.randint(0, 255, (64, 64), dtype=torch.uint8)
@@ -173,21 +165,20 @@ with warnings.catch_warnings(record=True) as w:
     result = ImageBlender.blend(img1, img2, mask, stream=dummy_stream)
     
     print(f"Warning raised: {w[0].message}")
-    # Output: Warning raised: A stream was provided, but the tensors are on CPU. The stream argument will be ignored.
 ```
 
-## API Reference
+## 📖 API Reference
 
 ### `ImageBlender.blend(img1, img2, mask, stream=None)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `img1` | `torch.Tensor` | Background image. Shape: `(H, W, C)`. Dtype: `uint8`. |
-| `img2` | `torch.Tensor` | Foreground image. Shape: `(H, W, C)`. Dtype: `uint8`. |
-| `mask` | `torch.Tensor` | Grayscale mask. Shape: `(H, W)`. Dtype: `uint8`. |
+| `img1` | `torch.Tensor` | Background image. Shape: `(H, W, C)`. Dtype: `uint8`, `float32`, or `float16`. |
+| `img2` | `torch.Tensor` | Foreground image. Must match `img1`'s shape and dtype. |
+| `mask` | `torch.Tensor` | Grayscale mask. Shape: `(H, W)`. Must match `img1`'s dtype. |
 | `stream` | `Optional[torch.cuda.Stream]` | If `None`, execution is **Synchronous**. If stream provided, execution is **Asynchronous**. Ignored for CPU tensors. |
 
-**Returns:** `torch.Tensor` - The blended image. Shape: `(H, W, C)`. Dtype: `uint8`.
+**Returns:** `torch.Tensor` - The blended image. Shape: `(H, W, C)`. Dtype matches the input tensors.
 
 ## License
 MIT License
