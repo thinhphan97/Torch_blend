@@ -9,7 +9,9 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 - **Contiguous Native Operations**: Directly accesses PyTorch tensor memory for contiguous inputs. Non-contiguous inputs are converted automatically before dispatch.
 - **Auto Sync/Async**: Runs synchronously if no stream is provided and asynchronously on the exact `torch.cuda.Stream` passed by the caller.
 - **Device-Aware**: Falls back to a pure C++ CPU loop if tensors are on CPU, with friendly warnings if streams are misused.
-- **Flexible Image Layout**: Supports HWC images with one or more channels, including grayscale, RGB, and RGBA.
+- **Flexible Tensor Layouts**: Supports OpenCV-style `HWC`, PyTorch-style `CHW`, and batched `BCHW`/`NCHW` tensors.
+- **Batch Processing**: Applies shared or per-sample masks to an entire image or feature-map batch.
+- **Layout-Specific CUDA Kernels**: Uses a coalesced linear kernel for `HWC` and maps `BCHW` batches to `gridDim.z`, channels to `gridDim.y`, and spatial pixels to `threadIdx.x`.
 - **Edge-Case Handling**: Preserves output metadata and safely handles empty spatial dimensions.
 - **Pythonic API**: Comes with a clean, typed Python wrapper with full docstrings and IDE autocomplete support.
 
@@ -23,7 +25,12 @@ torch_blend_package/
 │   ├── __init__.py
 │   ├── blend_module.py      # Python wrapper (Type hints, validation)
 │   └── ext/
-│       └── blend_cuda.cu    # C++/CUDA kernel and Pybind11 bindings
+│       ├── bindings.cpp     # Pybind11 module definition
+│       ├── blend.h          # Native extension public declarations
+│       ├── blend_common.h   # Shared layout metadata and index helpers
+│       ├── blend.cpp        # Device dispatcher and common validation
+│       ├── blend_cpu.cpp    # CPU backend
+│       └── blend_cuda.cu    # CUDA kernel and CUDA backend
 └── tests/                   # Unit tests
     ├── __init__.py
     ├── conftest.py          # Pytest fixtures
@@ -94,7 +101,8 @@ pip install dist/torch_blend-*.whl
 
 The test suite covers deterministic and randomized blending, CPU/CUDA execution,
 custom streams, supported dtypes and channel counts, non-contiguous tensors,
-empty inputs, output metadata, and input validation.
+empty inputs, `HWC`/`CHW`/`BCHW` layouts, batch masks, output metadata, and
+input validation.
 
 ```bash
 conda activate torch_blend_env
@@ -128,7 +136,7 @@ result = ImageBlender.blend(img1, img2, mask)
 cv2.imwrite("result_sync.jpg", result.cpu().numpy())
 ```
 
-### 2. Deep Learning Pipeline (float32 / float16)
+### 2. Deep Learning Pipeline (CHW / BCHW)
 Floating-point images and masks are interpreted directly; they are not normalized
 by the package. For standard alpha blending, use values in `[0.0, 1.0]`.
 Mask values outside this range are allowed and perform linear extrapolation.
@@ -137,17 +145,19 @@ Mask values outside this range are allowed and perform linear extrapolation.
 import torch
 from torch_blend import ImageBlender
 
-# Assume img1 and img2 have shape (H, W, C).
-# The mask must have shape (H, W).
+# PyTorch-standard batched images: (B, C, H, W)
+img1 = torch.rand(8, 3, 512, 512, device="cuda")
+img2 = torch.rand_like(img1)
+mask = torch.rand(8, 512, 512, device="cuda")
 
 # Asynchronous Blend on GPU using float16 (half precision) for speed
 my_stream = torch.cuda.Stream()
 
 # The stream is used directly, even outside a stream context manager.
 result_async = ImageBlender.blend(
-    img1.half().cuda(),
-    img2.half().cuda(),
-    mask.half().cuda(),
+    img1.half(),
+    img2.half(),
+    mask.half(),
     stream=my_stream,
 )
 
@@ -178,14 +188,15 @@ with warnings.catch_warnings(record=True) as w:
 
 ## 📖 API Reference
 
-### `ImageBlender.blend(img1, img2, mask, stream=None)`
+### `ImageBlender.blend(img1, img2, mask, stream=None, layout=None)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `img1` | `torch.Tensor` | Background image. Shape: `(H, W, C)`. Dtype: `uint8`, `float32`, or `float16`. |
+| `img1` | `torch.Tensor` | Background image or feature map. Shape: `(H, W, C)`, `(C, H, W)`, or `(B, C, H, W)`. |
 | `img2` | `torch.Tensor` | Foreground image. Must match `img1`'s shape and dtype. |
-| `mask` | `torch.Tensor` | Mask with shape `(H, W)` and the same dtype as the images. Full opacity is `255` for `uint8` and `1.0` for floating-point tensors. |
+| `mask` | `torch.Tensor` | Spatial mask. BCHW inputs accept `(H, W)`, `(B, H, W)`, or `(B, 1, H, W)`. |
 | `stream` | `Optional[torch.cuda.Stream]` | If `None`, CUDA execution is synchronous. If provided, execution is asynchronous on that exact stream. Ignored for CPU tensors. |
+| `layout` | `Optional[str]` | Explicitly selects `HWC`, `CHW`, `BCHW`, or `NCHW`. Usually inferred from image and mask shapes. |
 
 **Returns:** A contiguous tensor with shape, dtype, and device matching `img1`.
 Empty spatial dimensions return an empty tensor.
@@ -193,13 +204,29 @@ Empty spatial dimensions return an empty tensor.
 ### Input Requirements
 
 - All tensors must use the same device and dtype.
-- Images must have shape `(H, W, C)`; masks must have shape `(H, W)`.
+- Images must use `HWC`, `CHW`, or `BCHW`/`NCHW` layout.
+- Batched masks may be shared across the batch or supplied per sample.
 - Supported dtypes are `torch.uint8`, `torch.float16`, and `torch.float32`.
 - Non-contiguous tensors are accepted and converted internally.
 - Floating-point mask values outside `[0.0, 1.0]` are not clamped.
+- Ambiguous 3D shapes prefer `HWC`; pass `layout="CHW"` to override detection.
 
 Invalid shapes, devices, or mixed dtypes raise `ValueError`. Unsupported dtypes
 and invalid CUDA stream objects raise `TypeError`.
+
+## Native Extension Architecture
+
+- `bindings.cpp` exposes the native dispatcher to Python and contains no kernel logic.
+- `blend.cpp` validates native inputs, builds shared metadata, and selects the CPU or CUDA backend.
+- `blend_cpu.cpp` contains only the CPU implementation.
+- `blend_cuda.cu` contains only CUDA stream handling, kernel launch, and CUDA execution.
+- `blend_common.h` owns layout metadata and mask-index calculation shared by CPU and CUDA.
+- `blend.h` defines the internal extension interface between translation units.
+
+For channel-first tensors, CUDA uses `gridDim.z` rather than `blockDim.z` for
+the batch dimension. This preserves the full thread block for contiguous spatial
+work, avoids per-element batch/channel division, and keeps NCHW memory accesses
+coalesced within each channel plane.
 
 ## License
 MIT License

@@ -4,14 +4,25 @@ import warnings
 from torch_blend import ImageBlender
 
 
-def blend_reference_float(img1, img2, mask, device='cpu'):
+def blend_reference_float(img1, img2, mask, device='cpu', layout='HWC'):
     """Compute the expected blend in float32 on the requested device."""
     img1_d = img1.to(device).float()
     img2_d = img2.to(device).float()
     mask_d = mask.to(device).float()
     
     max_val = 255.0 if img1.dtype == torch.uint8 else 1.0
-    alpha = (mask_d / max_val).unsqueeze(-1)
+    alpha = mask_d / max_val
+    if layout == 'HWC':
+        alpha = alpha.unsqueeze(-1)
+    elif layout == 'CHW':
+        if alpha.dim() == 3:
+            alpha = alpha.squeeze(0)
+        alpha = alpha.unsqueeze(0)
+    elif layout in {'BCHW', 'NCHW'}:
+        if alpha.dim() == 2:
+            alpha = alpha.unsqueeze(0).unsqueeze(0)
+        elif alpha.dim() == 3:
+            alpha = alpha.unsqueeze(1)
     beta = 1.0 - alpha
     
     return img1_d * alpha + img2_d * beta
@@ -171,6 +182,90 @@ class TestStreamAndAsync:
         assert torch.equal(result, expected), "CPU blend with dummy stream failed"
 
 
+class TestTensorLayouts:
+    """Verify PyTorch-native CHW and BCHW tensor layouts."""
+
+    def test_chw_auto_detection(self):
+        """Infer CHW from a three-dimensional image and spatial mask."""
+        img1 = torch.randint(0, 256, (3, 4, 5), dtype=torch.uint8)
+        img2 = torch.randint(0, 256, (3, 4, 5), dtype=torch.uint8)
+        mask = torch.randint(0, 256, (4, 5), dtype=torch.uint8)
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask, layout='CHW').to(torch.uint8)
+
+        assert torch.equal(result, expected)
+
+    def test_chw_singleton_channel_mask(self):
+        """Accept a CHW mask with shape (1, H, W)."""
+        img1 = torch.rand((3, 4, 5), dtype=torch.float32)
+        img2 = torch.rand((3, 4, 5), dtype=torch.float32)
+        mask = torch.rand((1, 4, 5), dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask, layout='CHW')
+        expected = blend_reference_float(img1, img2, mask, layout='CHW')
+
+        torch.testing.assert_close(result, expected)
+
+    def test_explicit_chw_resolves_ambiguous_shape(self):
+        """Use the layout argument when a 3D shape is valid as HWC and CHW."""
+        img1 = torch.arange(27, dtype=torch.float32).reshape(3, 3, 3)
+        img2 = torch.flip(img1, dims=(0,))
+        mask = torch.tensor(
+            [[0.0, 0.25, 0.5], [0.75, 1.0, 0.25], [0.5, 0.75, 1.0]],
+            dtype=torch.float32,
+        )
+
+        result = ImageBlender.blend(img1, img2, mask, layout='CHW')
+        expected = blend_reference_float(img1, img2, mask, layout='CHW')
+
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("mask_layout", ["BHW", "B1HW", "HW"])
+    def test_bchw_batch_blend(self, mask_layout):
+        """Blend BCHW batches with per-sample or shared masks."""
+        img1 = torch.rand((2, 3, 4, 5), dtype=torch.float32)
+        img2 = torch.rand((2, 3, 4, 5), dtype=torch.float32)
+        if mask_layout == "BHW":
+            mask = torch.rand((2, 4, 5), dtype=torch.float32)
+        elif mask_layout == "B1HW":
+            mask = torch.rand((2, 1, 4, 5), dtype=torch.float32)
+        else:
+            mask = torch.rand((4, 5), dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask, layout='BCHW')
+
+        torch.testing.assert_close(result, expected)
+
+    def test_non_contiguous_bchw_inputs(self):
+        """Blend non-contiguous BCHW tensors after internal normalization."""
+        img1 = torch.rand((2, 3, 5, 4), dtype=torch.float32).transpose(2, 3)
+        img2 = torch.rand((2, 3, 5, 4), dtype=torch.float32).transpose(2, 3)
+        mask = torch.rand((2, 5, 4), dtype=torch.float32).transpose(1, 2)
+        assert not img1.is_contiguous()
+        assert not img2.is_contiguous()
+        assert not mask.is_contiguous()
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask, layout='BCHW')
+
+        torch.testing.assert_close(result, expected)
+        assert result.is_contiguous()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bchw_cuda_blend(self):
+        """Verify batched BCHW blending on CUDA."""
+        img1 = torch.rand((2, 3, 8, 8), dtype=torch.float32, device='cuda')
+        img2 = torch.rand_like(img1)
+        mask = torch.rand((2, 8, 8), dtype=torch.float32, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask, device='cuda', layout='BCHW')
+
+        torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+
 class TestInputValidation:
     """Verify that invalid tensor and stream inputs are rejected."""
 
@@ -194,7 +289,7 @@ class TestInputValidation:
         img1, img2, mask = sample_tensors
         mask_3d = torch.randint(0, 256, (64, 64, 1), dtype=torch.uint8)
         
-        with pytest.raises(ValueError, match="Mask must be 2D"):
+        with pytest.raises(ValueError, match="Cannot infer"):
             ImageBlender.blend(img1, img2, mask_3d)
 
     def test_device_mismatch(self, sample_tensors):
@@ -229,14 +324,14 @@ class TestInputValidation:
         with pytest.raises(TypeError, match="Unsupported dtype"):
             ImageBlender.blend(img1, img2, mask)
 
-    @pytest.mark.parametrize("shape", [(4, 4), (1, 4, 4, 3)])
+    @pytest.mark.parametrize("shape", [(4, 4), (1, 2, 3, 4, 5)])
     def test_invalid_image_dimensions(self, shape):
-        """Reject images that are not three-dimensional HWC tensors."""
+        """Reject images that are neither 3D nor 4D tensors."""
         img1 = torch.zeros(shape, dtype=torch.uint8)
         img2 = torch.zeros_like(img1)
         mask = torch.zeros((4, 4), dtype=torch.uint8)
 
-        with pytest.raises(ValueError, match="Images must be 3D"):
+        with pytest.raises(ValueError, match="Images must be 3D.*or 4D"):
             ImageBlender.blend(img1, img2, mask)
 
     def test_mask_spatial_shape_mismatch(self):
@@ -245,7 +340,23 @@ class TestInputValidation:
         img2 = torch.zeros_like(img1)
         mask = torch.zeros((4, 4), dtype=torch.uint8)
 
-        with pytest.raises(ValueError, match="Mask spatial shape must match"):
+        with pytest.raises(ValueError, match="HWC inputs require a mask"):
+            ImageBlender.blend(img1, img2, mask, layout='HWC')
+
+    def test_invalid_layout(self, sample_tensors):
+        """Reject unknown explicit layout names."""
+        img1, img2, mask = sample_tensors
+
+        with pytest.raises(ValueError, match="Layout must be one of"):
+            ImageBlender.blend(img1, img2, mask, layout='NHWC')
+
+    def test_invalid_bchw_mask_shape(self):
+        """Reject batched masks that do not match batch or spatial dimensions."""
+        img1 = torch.zeros((2, 3, 4, 5), dtype=torch.float32)
+        img2 = torch.zeros_like(img1)
+        mask = torch.zeros((3, 4, 5), dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="BCHW masks must have shape"):
             ImageBlender.blend(img1, img2, mask)
 
 

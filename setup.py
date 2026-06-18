@@ -8,7 +8,12 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="torch_blend._torch_blend_cuda",
-            sources=["torch_blend/ext/blend_cuda.cu"],
+            sources=[
+                "torch_blend/ext/bindings.cpp",
+                "torch_blend/ext/blend.cpp",
+                "torch_blend/ext/blend_cpu.cpp",
+                "torch_blend/ext/blend_cuda.cu",
+            ],
         )
     ],
     cmdclass={
