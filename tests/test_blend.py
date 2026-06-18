@@ -266,6 +266,111 @@ class TestTensorLayouts:
         torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
 
 
+class TestVectorizedCuda:
+    """Verify CUDA vectorized fast paths and scalar fallback behavior."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+    def test_hwc_four_channel_vectorized_blend(self, dtype):
+        """Verify uchar4 and float4 HWC blending for four-channel images."""
+        if dtype == torch.uint8:
+            img1 = torch.randint(0, 256, (16, 20, 4), dtype=dtype, device='cuda')
+            img2 = torch.randint(0, 256, (16, 20, 4), dtype=dtype, device='cuda')
+            mask = torch.randint(0, 256, (16, 20), dtype=dtype, device='cuda')
+        else:
+            img1 = torch.rand((16, 20, 4), dtype=dtype, device='cuda')
+            img2 = torch.rand((16, 20, 4), dtype=dtype, device='cuda')
+            mask = torch.rand((16, 20), dtype=dtype, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask, layout='HWC')
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            device='cuda',
+            layout='HWC',
+        )
+
+        if dtype == torch.uint8:
+            torch.testing.assert_close(
+                result.float(),
+                expected.to(dtype).float(),
+                rtol=0,
+                atol=1,
+            )
+        else:
+            torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+    @pytest.mark.parametrize("mask_layout", ["BHW", "HW"])
+    def test_bchw_vectorized_blend(self, dtype, mask_layout):
+        """Verify vectorized BCHW blending with batched and shared masks."""
+        shape = (2, 3, 8, 12)
+        if dtype == torch.uint8:
+            img1 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            img2 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            mask_shape = (2, 8, 12) if mask_layout == "BHW" else (8, 12)
+            mask = torch.randint(0, 256, mask_shape, dtype=dtype, device='cuda')
+        else:
+            img1 = torch.rand(shape, dtype=dtype, device='cuda')
+            img2 = torch.rand(shape, dtype=dtype, device='cuda')
+            mask_shape = (2, 8, 12) if mask_layout == "BHW" else (8, 12)
+            mask = torch.rand(mask_shape, dtype=dtype, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            device='cuda',
+            layout='BCHW',
+        )
+
+        if dtype == torch.uint8:
+            torch.testing.assert_close(
+                result.float(),
+                expected.to(dtype).float(),
+                rtol=0,
+                atol=1,
+            )
+        else:
+            torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+    def test_bchw_scalar_fallback_for_unaligned_plane_size(self, dtype):
+        """Verify scalar fallback when H*W is not divisible by four."""
+        shape = (2, 3, 3, 5)
+        if dtype == torch.uint8:
+            img1 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            img2 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            mask = torch.randint(0, 256, (2, 3, 5), dtype=dtype, device='cuda')
+        else:
+            img1 = torch.rand(shape, dtype=dtype, device='cuda')
+            img2 = torch.rand(shape, dtype=dtype, device='cuda')
+            mask = torch.rand((2, 3, 5), dtype=dtype, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            device='cuda',
+            layout='BCHW',
+        )
+
+        if dtype == torch.uint8:
+            torch.testing.assert_close(
+                result.float(),
+                expected.to(dtype).float(),
+                rtol=0,
+                atol=1,
+            )
+        else:
+            torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+
 class TestInputValidation:
     """Verify that invalid tensor and stream inputs are rejected."""
 

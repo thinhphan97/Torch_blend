@@ -12,6 +12,7 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 - **Flexible Tensor Layouts**: Supports OpenCV-style `HWC`, PyTorch-style `CHW`, and batched `BCHW`/`NCHW` tensors.
 - **Batch Processing**: Applies shared or per-sample masks to an entire image or feature-map batch.
 - **Layout-Specific CUDA Kernels**: Uses a coalesced linear kernel for `HWC` and maps `BCHW` batches to `gridDim.z`, channels to `gridDim.y`, and spatial pixels to `threadIdx.x`.
+- **Vectorized CUDA Access**: Uses `uchar4` and `float4` fast paths when tensor layout, alignment, and spatial dimensions permit four-value memory transactions.
 - **Edge-Case Handling**: Preserves output metadata and safely handles empty spatial dimensions.
 - **Pythonic API**: Comes with a clean, typed Python wrapper with full docstrings and IDE autocomplete support.
 
@@ -227,6 +228,22 @@ For channel-first tensors, CUDA uses `gridDim.z` rather than `blockDim.z` for
 the batch dimension. This preserves the full thread block for contiguous spatial
 work, avoids per-element batch/channel division, and keeps NCHW memory accesses
 coalesced within each channel plane.
+
+### CUDA Vectorization
+
+The CUDA backend selects vectorized kernels automatically:
+
+- `HWC` uses `uchar4` or `float4` when the image has exactly four channels.
+  Each thread loads and stores one complete four-channel pixel using one mask value.
+- `CHW` and `BCHW` use four-value vectors across adjacent spatial positions when
+  `H * W` is divisible by four.
+- `uint8` uses `uchar4`; `float32` uses `float4`.
+- All image, mask, and output pointers must satisfy the vector type's alignment.
+- RGB `HWC`, `float16`, non-divisible spatial sizes, and unaligned pointers
+  automatically use the scalar kernels.
+
+Vectorization does not change the Python API or output layout. It reduces the
+number of memory instructions for bandwidth-bound high-resolution workloads.
 
 ## License
 MIT License

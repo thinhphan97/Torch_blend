@@ -3,7 +3,26 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <cstdint>
+
 namespace {
+
+bool is_aligned(const void* pointer, std::uintptr_t alignment) {
+    return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
+}
+
+__device__ unsigned char blend_uint8_value(
+    unsigned char img1,
+    unsigned char img2,
+    float alpha) {
+    return static_cast<unsigned char>(
+        static_cast<float>(img1) * alpha
+        + static_cast<float>(img2) * (1.0f - alpha));
+}
+
+__device__ float blend_float_value(float img1, float img2, float alpha) {
+    return img1 * alpha + img2 * (1.0f - alpha);
+}
 
 template <typename scalar_t>
 __global__ void blend_hwc_kernel(
@@ -26,6 +45,52 @@ __global__ void blend_hwc_kernel(
         static_cast<float>(img1[index]) * alpha
         + static_cast<float>(img2[index]) * (1.0f - alpha);
     output[index] = static_cast<scalar_t>(value);
+}
+
+__global__ void blend_hwc_uchar4_kernel(
+    const uchar4* __restrict__ img1,
+    const uchar4* __restrict__ img2,
+    const unsigned char* __restrict__ mask,
+    uchar4* __restrict__ output,
+    int64_t pixel_count) {
+    const int64_t pixel_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pixel_index >= pixel_count) {
+        return;
+    }
+
+    const float alpha = static_cast<float>(mask[pixel_index]) / 255.0f;
+    const uchar4 img1_value = img1[pixel_index];
+    const uchar4 img2_value = img2[pixel_index];
+
+    output[pixel_index] = make_uchar4(
+        blend_uint8_value(img1_value.x, img2_value.x, alpha),
+        blend_uint8_value(img1_value.y, img2_value.y, alpha),
+        blend_uint8_value(img1_value.z, img2_value.z, alpha),
+        blend_uint8_value(img1_value.w, img2_value.w, alpha));
+}
+
+__global__ void blend_hwc_float4_kernel(
+    const float4* __restrict__ img1,
+    const float4* __restrict__ img2,
+    const float* __restrict__ mask,
+    float4* __restrict__ output,
+    int64_t pixel_count) {
+    const int64_t pixel_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pixel_index >= pixel_count) {
+        return;
+    }
+
+    const float alpha = mask[pixel_index];
+    const float4 img1_value = img1[pixel_index];
+    const float4 img2_value = img2[pixel_index];
+
+    output[pixel_index] = make_float4(
+        blend_float_value(img1_value.x, img2_value.x, alpha),
+        blend_float_value(img1_value.y, img2_value.y, alpha),
+        blend_float_value(img1_value.z, img2_value.z, alpha),
+        blend_float_value(img1_value.w, img2_value.w, alpha));
 }
 
 template <typename scalar_t>
@@ -61,6 +126,88 @@ __global__ void blend_channel_first_kernel(
     output[image_index] = static_cast<scalar_t>(value);
 }
 
+__global__ void blend_channel_first_uchar4_kernel(
+    const uchar4* __restrict__ img1,
+    const uchar4* __restrict__ img2,
+    const uchar4* __restrict__ mask,
+    uchar4* __restrict__ output,
+    int64_t vectors_per_plane,
+    int64_t vectors_per_sample,
+    bool mask_is_batched) {
+    const int64_t vector_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (vector_index >= vectors_per_plane) {
+        return;
+    }
+
+    const int64_t batch_index = blockIdx.z;
+    const int64_t channel_index = blockIdx.y;
+    const int64_t image_index =
+        batch_index * vectors_per_sample
+        + channel_index * vectors_per_plane
+        + vector_index;
+    const int64_t mask_index =
+        (mask_is_batched ? batch_index * vectors_per_plane : 0)
+        + vector_index;
+
+    const uchar4 img1_value = img1[image_index];
+    const uchar4 img2_value = img2[image_index];
+    const uchar4 mask_value = mask[mask_index];
+
+    output[image_index] = make_uchar4(
+        blend_uint8_value(
+            img1_value.x,
+            img2_value.x,
+            static_cast<float>(mask_value.x) / 255.0f),
+        blend_uint8_value(
+            img1_value.y,
+            img2_value.y,
+            static_cast<float>(mask_value.y) / 255.0f),
+        blend_uint8_value(
+            img1_value.z,
+            img2_value.z,
+            static_cast<float>(mask_value.z) / 255.0f),
+        blend_uint8_value(
+            img1_value.w,
+            img2_value.w,
+            static_cast<float>(mask_value.w) / 255.0f));
+}
+
+__global__ void blend_channel_first_float4_kernel(
+    const float4* __restrict__ img1,
+    const float4* __restrict__ img2,
+    const float4* __restrict__ mask,
+    float4* __restrict__ output,
+    int64_t vectors_per_plane,
+    int64_t vectors_per_sample,
+    bool mask_is_batched) {
+    const int64_t vector_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (vector_index >= vectors_per_plane) {
+        return;
+    }
+
+    const int64_t batch_index = blockIdx.z;
+    const int64_t channel_index = blockIdx.y;
+    const int64_t image_index =
+        batch_index * vectors_per_sample
+        + channel_index * vectors_per_plane
+        + vector_index;
+    const int64_t mask_index =
+        (mask_is_batched ? batch_index * vectors_per_plane : 0)
+        + vector_index;
+
+    const float4 img1_value = img1[image_index];
+    const float4 img2_value = img2[image_index];
+    const float4 mask_value = mask[mask_index];
+
+    output[image_index] = make_float4(
+        blend_float_value(img1_value.x, img2_value.x, mask_value.x),
+        blend_float_value(img1_value.y, img2_value.y, mask_value.y),
+        blend_float_value(img1_value.z, img2_value.z, mask_value.z),
+        blend_float_value(img1_value.w, img2_value.w, mask_value.w));
+}
+
 }  // namespace
 
 void blend_cuda(
@@ -85,57 +232,151 @@ void blend_cuda(
     }
 
     constexpr int threads = 256;
+    bool launched = false;
+    int64_t batch_size = 1;
 
-    AT_DISPATCH_ALL_TYPES_AND(
-        at::ScalarType::Half,
-        img1.scalar_type(),
-        "blend_images_cuda",
-        [&] {
-            if (metadata.layout == BlendLayout::HWC) {
-                const int blocks = static_cast<int>(
-                    (metadata.numel + threads - 1) / threads);
-                blend_hwc_kernel<scalar_t><<<
-                    blocks,
-                    threads,
-                    0,
-                    cuda_stream>>>(
-                        img1.data_ptr<scalar_t>(),
-                        img2.data_ptr<scalar_t>(),
-                        mask.data_ptr<scalar_t>(),
-                        output.data_ptr<scalar_t>(),
-                        metadata.numel,
-                        metadata.channels,
-                        max_value);
-            } else {
-                const int64_t batch_size =
-                    metadata.numel / metadata.sample_size;
-                TORCH_CHECK(
-                    batch_size <= 65535,
-                    "CUDA batch size exceeds gridDim.z limit");
-                TORCH_CHECK(
-                    metadata.channels <= 65535,
-                    "CUDA channel count exceeds gridDim.y limit");
+    if (metadata.layout != BlendLayout::HWC) {
+        batch_size = metadata.numel / metadata.sample_size;
+        TORCH_CHECK(
+            batch_size <= 65535,
+            "CUDA batch size exceeds gridDim.z limit");
+        TORCH_CHECK(
+            metadata.channels <= 65535,
+            "CUDA channel count exceeds gridDim.y limit");
+    }
 
-                const dim3 grid(
-                    static_cast<unsigned int>(
-                        (metadata.spatial_size + threads - 1) / threads),
-                    static_cast<unsigned int>(metadata.channels),
-                    static_cast<unsigned int>(batch_size));
-                blend_channel_first_kernel<scalar_t><<<
-                    grid,
-                    threads,
-                    0,
-                    cuda_stream>>>(
-                        img1.data_ptr<scalar_t>(),
-                        img2.data_ptr<scalar_t>(),
-                        mask.data_ptr<scalar_t>(),
-                        output.data_ptr<scalar_t>(),
-                        metadata.spatial_size,
-                        metadata.sample_size,
-                        metadata.mask_is_batched,
-                        max_value);
-            }
-        });
+    if (metadata.layout == BlendLayout::HWC && metadata.channels == 4) {
+        const int64_t pixel_count = metadata.numel / 4;
+        const int blocks =
+            static_cast<int>((pixel_count + threads - 1) / threads);
+
+        if (
+            img1.scalar_type() == at::ScalarType::Byte
+            && is_aligned(img1.data_ptr<unsigned char>(), alignof(uchar4))
+            && is_aligned(img2.data_ptr<unsigned char>(), alignof(uchar4))
+            && is_aligned(output.data_ptr<unsigned char>(), alignof(uchar4))) {
+            blend_hwc_uchar4_kernel<<<blocks, threads, 0, cuda_stream>>>(
+                reinterpret_cast<const uchar4*>(img1.data_ptr<unsigned char>()),
+                reinterpret_cast<const uchar4*>(img2.data_ptr<unsigned char>()),
+                mask.data_ptr<unsigned char>(),
+                reinterpret_cast<uchar4*>(output.data_ptr<unsigned char>()),
+                pixel_count);
+            launched = true;
+        } else if (
+            img1.scalar_type() == at::ScalarType::Float
+            && is_aligned(img1.data_ptr<float>(), alignof(float4))
+            && is_aligned(img2.data_ptr<float>(), alignof(float4))
+            && is_aligned(output.data_ptr<float>(), alignof(float4))) {
+            blend_hwc_float4_kernel<<<blocks, threads, 0, cuda_stream>>>(
+                reinterpret_cast<const float4*>(img1.data_ptr<float>()),
+                reinterpret_cast<const float4*>(img2.data_ptr<float>()),
+                mask.data_ptr<float>(),
+                reinterpret_cast<float4*>(output.data_ptr<float>()),
+                pixel_count);
+            launched = true;
+        }
+    }
+
+    if (
+        !launched
+        && metadata.layout != BlendLayout::HWC
+        && metadata.spatial_size % 4 == 0) {
+        const int64_t vectors_per_plane = metadata.spatial_size / 4;
+        const int64_t vectors_per_sample = metadata.sample_size / 4;
+        const dim3 grid(
+            static_cast<unsigned int>(
+                (vectors_per_plane + threads - 1) / threads),
+            static_cast<unsigned int>(metadata.channels),
+            static_cast<unsigned int>(batch_size));
+
+        if (
+            img1.scalar_type() == at::ScalarType::Byte
+            && is_aligned(img1.data_ptr<unsigned char>(), alignof(uchar4))
+            && is_aligned(img2.data_ptr<unsigned char>(), alignof(uchar4))
+            && is_aligned(mask.data_ptr<unsigned char>(), alignof(uchar4))
+            && is_aligned(output.data_ptr<unsigned char>(), alignof(uchar4))) {
+            blend_channel_first_uchar4_kernel<<<
+                grid,
+                threads,
+                0,
+                cuda_stream>>>(
+                    reinterpret_cast<const uchar4*>(
+                        img1.data_ptr<unsigned char>()),
+                    reinterpret_cast<const uchar4*>(
+                        img2.data_ptr<unsigned char>()),
+                    reinterpret_cast<const uchar4*>(
+                        mask.data_ptr<unsigned char>()),
+                    reinterpret_cast<uchar4*>(
+                        output.data_ptr<unsigned char>()),
+                    vectors_per_plane,
+                    vectors_per_sample,
+                    metadata.mask_is_batched);
+            launched = true;
+        } else if (
+            img1.scalar_type() == at::ScalarType::Float
+            && is_aligned(img1.data_ptr<float>(), alignof(float4))
+            && is_aligned(img2.data_ptr<float>(), alignof(float4))
+            && is_aligned(mask.data_ptr<float>(), alignof(float4))
+            && is_aligned(output.data_ptr<float>(), alignof(float4))) {
+            blend_channel_first_float4_kernel<<<
+                grid,
+                threads,
+                0,
+                cuda_stream>>>(
+                    reinterpret_cast<const float4*>(img1.data_ptr<float>()),
+                    reinterpret_cast<const float4*>(img2.data_ptr<float>()),
+                    reinterpret_cast<const float4*>(mask.data_ptr<float>()),
+                    reinterpret_cast<float4*>(output.data_ptr<float>()),
+                    vectors_per_plane,
+                    vectors_per_sample,
+                    metadata.mask_is_batched);
+            launched = true;
+        }
+    }
+
+    if (!launched) {
+        AT_DISPATCH_ALL_TYPES_AND(
+            at::ScalarType::Half,
+            img1.scalar_type(),
+            "blend_images_cuda_scalar",
+            [&] {
+                if (metadata.layout == BlendLayout::HWC) {
+                    const int blocks = static_cast<int>(
+                        (metadata.numel + threads - 1) / threads);
+                    blend_hwc_kernel<scalar_t><<<
+                        blocks,
+                        threads,
+                        0,
+                        cuda_stream>>>(
+                            img1.data_ptr<scalar_t>(),
+                            img2.data_ptr<scalar_t>(),
+                            mask.data_ptr<scalar_t>(),
+                            output.data_ptr<scalar_t>(),
+                            metadata.numel,
+                            metadata.channels,
+                            max_value);
+                } else {
+                    const dim3 grid(
+                        static_cast<unsigned int>(
+                            (metadata.spatial_size + threads - 1) / threads),
+                        static_cast<unsigned int>(metadata.channels),
+                        static_cast<unsigned int>(batch_size));
+                    blend_channel_first_kernel<scalar_t><<<
+                        grid,
+                        threads,
+                        0,
+                        cuda_stream>>>(
+                            img1.data_ptr<scalar_t>(),
+                            img2.data_ptr<scalar_t>(),
+                            mask.data_ptr<scalar_t>(),
+                            output.data_ptr<scalar_t>(),
+                            metadata.spatial_size,
+                            metadata.sample_size,
+                            metadata.mask_is_batched,
+                            max_value);
+                }
+            });
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     if (!stream.has_value()) {
