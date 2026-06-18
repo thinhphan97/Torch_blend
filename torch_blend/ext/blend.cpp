@@ -38,6 +38,7 @@ torch::Tensor blend(
     bool mask_is_batched,
     int64_t height,
     int64_t width,
+    int blend_mode,
     c10::optional<torch::Stream> stream) {
     TORCH_CHECK(img1.dim() == 3 || img1.dim() == 4, "Images must be 3D or 4D");
     TORCH_CHECK(img1.sizes() == img2.sizes(), "Image shapes must match");
@@ -50,6 +51,10 @@ torch::Tensor blend(
     TORCH_CHECK(img1.is_contiguous(), "img1 must be contiguous");
     TORCH_CHECK(img2.is_contiguous(), "img2 must be contiguous");
     TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
+    TORCH_CHECK(
+        blend_mode >= static_cast<int>(BlendMode::Linear)
+            && blend_mode <= static_cast<int>(BlendMode::Overlay),
+        "Invalid blend mode code");
 
     auto output = torch::empty_like(img1);
     if (output.numel() == 0) {
@@ -63,11 +68,27 @@ torch::Tensor blend(
         height,
         width);
     const float max_value = img1.is_floating_point() ? 1.0f : 255.0f;
+    const auto selected_mode = static_cast<BlendMode>(blend_mode);
 
     if (img1.is_cuda()) {
-        blend_cuda(img1, img2, mask, output, metadata, max_value, stream);
+        blend_cuda(
+            img1,
+            img2,
+            mask,
+            output,
+            metadata,
+            max_value,
+            selected_mode,
+            stream);
     } else if (img1.is_cpu()) {
-        blend_cpu(img1, img2, mask, output, metadata, max_value);
+        blend_cpu(
+            img1,
+            img2,
+            mask,
+            output,
+            metadata,
+            max_value,
+            selected_mode);
     } else {
         TORCH_CHECK(false, "Unsupported device type");
     }

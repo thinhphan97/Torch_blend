@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 
 #include "blend_common.h"
+#include "blend_modes.h"
 
 torch::Tensor blend(
     torch::Tensor img1,
@@ -12,6 +13,7 @@ torch::Tensor blend(
     bool mask_is_batched,
     int64_t height,
     int64_t width,
+    int blend_mode,
     c10::optional<torch::Stream> stream);
 
 void blend_cpu(
@@ -20,7 +22,8 @@ void blend_cpu(
     const torch::Tensor& mask,
     torch::Tensor& output,
     const BlendMetadata& metadata,
-    float max_value);
+    float max_value,
+    BlendMode blend_mode);
 
 void blend_cuda(
     const torch::Tensor& img1,
@@ -29,4 +32,5 @@ void blend_cuda(
     torch::Tensor& output,
     const BlendMetadata& metadata,
     float max_value,
+    BlendMode blend_mode,
     c10::optional<torch::Stream> stream);

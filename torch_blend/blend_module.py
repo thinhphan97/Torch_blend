@@ -18,15 +18,17 @@ class ImageBlender:
         mask: torch.Tensor,
         stream: Optional[torch.cuda.Stream] = None,
         layout: Optional[str] = None,
+        mode: str = "linear",
     ) -> torch.Tensor:
         """
         Blends two images using a mask. Supports CPU and CUDA, with multi-dtype capabilities.
         
         Args:
-            img1 (torch.Tensor): Background image with shape (H, W, C),
+            img1 (torch.Tensor): Source or blend layer with shape (H, W, C),
                 (C, H, W), or (B, C, H, W).
                 Supported dtypes are uint8, float16, and float32.
-            img2 (torch.Tensor): Foreground image. Must match img1's shape and dtype.
+            img2 (torch.Tensor): Base layer returned where the mask is zero.
+                Must match img1's shape and dtype.
             mask (torch.Tensor): Mask matching the spatial dimensions. Batched
                 inputs accept (B, H, W), (B, 1, H, W), or a shared (H, W) mask.
                 uint8 masks use 255 as full opacity. Floating-point masks use 1.0;
@@ -40,6 +42,9 @@ class ImageBlender:
                 "CHW", "BCHW", or "NCHW". By default, the layout is inferred
                 from image and mask shapes. Ambiguous 3D inputs prefer HWC for
                 backward compatibility.
+            mode (str, optional): Blend mode. Supported values are "linear",
+                "normal", "multiply", "screen", and "overlay". The mode result
+                is composited over img2 using the supplied mask.
             
         Returns:
             torch.Tensor: A contiguous blended image with the same shape as img1.
@@ -47,13 +52,15 @@ class ImageBlender:
                 return an empty tensor with matching metadata.
             
         Raises:
-            ValueError: If devices, shapes, dtypes, layouts, or mask dimensions are invalid.
-            TypeError: If the dtype is unsupported or stream is not a torch.cuda.Stream instance.
+            ValueError: If devices, shapes, dtypes, layouts, mask dimensions,
+                or blend mode names are invalid.
+            TypeError: If dtype, mode type, or stream type is unsupported.
 
         Notes:
             Non-contiguous inputs are converted to contiguous tensors. For 3D
             inputs whose shapes are valid as both HWC and CHW, pass layout
-            explicitly to select CHW.
+            explicitly to select CHW. Blend modes are evaluated first and then
+            composited over img2 using the mask, so mask=0 returns img2.
             
         Example (Sync - uint8):
             >>> img1 = torch.randint(0, 255, (1080, 1920, 3), dtype=torch.uint8)
@@ -68,6 +75,13 @@ class ImageBlender:
         """
         supported_dtypes = {torch.uint8, torch.float16, torch.float32}
         layout_codes = {"HWC": 0, "CHW": 1, "BCHW": 2, "NCHW": 2}
+        mode_codes = {
+            "linear": 0,
+            "normal": 0,
+            "multiply": 1,
+            "screen": 2,
+            "overlay": 3,
+        }
 
         if img1.device != img2.device or img1.device != mask.device:
             raise ValueError("All tensors must be located on the same device.")
@@ -79,6 +93,13 @@ class ImageBlender:
             raise TypeError(
                 f"Unsupported dtype {img1.dtype}. "
                 "Supported dtypes are torch.uint8, torch.float16, and torch.float32."
+            )
+        if not isinstance(mode, str):
+            raise TypeError("Mode must be a string.")
+        normalized_mode = mode.lower()
+        if normalized_mode not in mode_codes:
+            raise ValueError(
+                "Mode must be one of: linear, normal, multiply, screen, or overlay."
             )
 
         normalized_layout = layout.upper() if layout is not None else None
@@ -160,5 +181,6 @@ class ImageBlender:
             mask_is_batched,
             height,
             width,
+            mode_codes[normalized_mode],
             stream,
         )

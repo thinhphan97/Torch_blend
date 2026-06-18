@@ -11,20 +11,25 @@ bool is_aligned(const void* pointer, std::uintptr_t alignment) {
     return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
 }
 
+template <BlendMode mode>
 __device__ unsigned char blend_uint8_value(
     unsigned char img1,
     unsigned char img2,
     float alpha) {
     return static_cast<unsigned char>(
-        static_cast<float>(img1) * alpha
-        + static_cast<float>(img2) * (1.0f - alpha));
+        compose_blend_value<mode>(
+            static_cast<float>(img1),
+            static_cast<float>(img2),
+            alpha,
+            255.0f));
 }
 
+template <BlendMode mode>
 __device__ float blend_float_value(float img1, float img2, float alpha) {
-    return img1 * alpha + img2 * (1.0f - alpha);
+    return compose_blend_value<mode>(img1, img2, alpha, 1.0f);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, BlendMode mode>
 __global__ void blend_hwc_kernel(
     const scalar_t* __restrict__ img1,
     const scalar_t* __restrict__ img2,
@@ -41,12 +46,15 @@ __global__ void blend_hwc_kernel(
 
     const int64_t mask_index = index / channels;
     const float alpha = static_cast<float>(mask[mask_index]) / max_value;
-    const float value =
-        static_cast<float>(img1[index]) * alpha
-        + static_cast<float>(img2[index]) * (1.0f - alpha);
+    const float value = compose_blend_value<mode>(
+        static_cast<float>(img1[index]),
+        static_cast<float>(img2[index]),
+        alpha,
+        max_value);
     output[index] = static_cast<scalar_t>(value);
 }
 
+template <BlendMode mode>
 __global__ void blend_hwc_uchar4_kernel(
     const uchar4* __restrict__ img1,
     const uchar4* __restrict__ img2,
@@ -64,12 +72,13 @@ __global__ void blend_hwc_uchar4_kernel(
     const uchar4 img2_value = img2[pixel_index];
 
     output[pixel_index] = make_uchar4(
-        blend_uint8_value(img1_value.x, img2_value.x, alpha),
-        blend_uint8_value(img1_value.y, img2_value.y, alpha),
-        blend_uint8_value(img1_value.z, img2_value.z, alpha),
-        blend_uint8_value(img1_value.w, img2_value.w, alpha));
+        blend_uint8_value<mode>(img1_value.x, img2_value.x, alpha),
+        blend_uint8_value<mode>(img1_value.y, img2_value.y, alpha),
+        blend_uint8_value<mode>(img1_value.z, img2_value.z, alpha),
+        blend_uint8_value<mode>(img1_value.w, img2_value.w, alpha));
 }
 
+template <BlendMode mode>
 __global__ void blend_hwc_float4_kernel(
     const float4* __restrict__ img1,
     const float4* __restrict__ img2,
@@ -87,13 +96,13 @@ __global__ void blend_hwc_float4_kernel(
     const float4 img2_value = img2[pixel_index];
 
     output[pixel_index] = make_float4(
-        blend_float_value(img1_value.x, img2_value.x, alpha),
-        blend_float_value(img1_value.y, img2_value.y, alpha),
-        blend_float_value(img1_value.z, img2_value.z, alpha),
-        blend_float_value(img1_value.w, img2_value.w, alpha));
+        blend_float_value<mode>(img1_value.x, img2_value.x, alpha),
+        blend_float_value<mode>(img1_value.y, img2_value.y, alpha),
+        blend_float_value<mode>(img1_value.z, img2_value.z, alpha),
+        blend_float_value<mode>(img1_value.w, img2_value.w, alpha));
 }
 
-template <typename scalar_t>
+template <typename scalar_t, BlendMode mode>
 __global__ void blend_channel_first_kernel(
     const scalar_t* __restrict__ img1,
     const scalar_t* __restrict__ img2,
@@ -120,12 +129,15 @@ __global__ void blend_channel_first_kernel(
         + spatial_index;
 
     const float alpha = static_cast<float>(mask[mask_index]) / max_value;
-    const float value =
-        static_cast<float>(img1[image_index]) * alpha
-        + static_cast<float>(img2[image_index]) * (1.0f - alpha);
+    const float value = compose_blend_value<mode>(
+        static_cast<float>(img1[image_index]),
+        static_cast<float>(img2[image_index]),
+        alpha,
+        max_value);
     output[image_index] = static_cast<scalar_t>(value);
 }
 
+template <BlendMode mode>
 __global__ void blend_channel_first_uchar4_kernel(
     const uchar4* __restrict__ img1,
     const uchar4* __restrict__ img2,
@@ -155,24 +167,25 @@ __global__ void blend_channel_first_uchar4_kernel(
     const uchar4 mask_value = mask[mask_index];
 
     output[image_index] = make_uchar4(
-        blend_uint8_value(
+        blend_uint8_value<mode>(
             img1_value.x,
             img2_value.x,
             static_cast<float>(mask_value.x) / 255.0f),
-        blend_uint8_value(
+        blend_uint8_value<mode>(
             img1_value.y,
             img2_value.y,
             static_cast<float>(mask_value.y) / 255.0f),
-        blend_uint8_value(
+        blend_uint8_value<mode>(
             img1_value.z,
             img2_value.z,
             static_cast<float>(mask_value.z) / 255.0f),
-        blend_uint8_value(
+        blend_uint8_value<mode>(
             img1_value.w,
             img2_value.w,
             static_cast<float>(mask_value.w) / 255.0f));
 }
 
+template <BlendMode mode>
 __global__ void blend_channel_first_float4_kernel(
     const float4* __restrict__ img1,
     const float4* __restrict__ img2,
@@ -202,35 +215,21 @@ __global__ void blend_channel_first_float4_kernel(
     const float4 mask_value = mask[mask_index];
 
     output[image_index] = make_float4(
-        blend_float_value(img1_value.x, img2_value.x, mask_value.x),
-        blend_float_value(img1_value.y, img2_value.y, mask_value.y),
-        blend_float_value(img1_value.z, img2_value.z, mask_value.z),
-        blend_float_value(img1_value.w, img2_value.w, mask_value.w));
+        blend_float_value<mode>(img1_value.x, img2_value.x, mask_value.x),
+        blend_float_value<mode>(img1_value.y, img2_value.y, mask_value.y),
+        blend_float_value<mode>(img1_value.z, img2_value.z, mask_value.z),
+        blend_float_value<mode>(img1_value.w, img2_value.w, mask_value.w));
 }
 
-}  // namespace
-
-void blend_cuda(
+template <BlendMode mode>
+void launch_blend_cuda(
     const torch::Tensor& img1,
     const torch::Tensor& img2,
     const torch::Tensor& mask,
     torch::Tensor& output,
     const BlendMetadata& metadata,
     float max_value,
-    c10::optional<torch::Stream> stream) {
-    cudaStream_t cuda_stream =
-        c10::cuda::getCurrentCUDAStream(img1.device().index());
-    if (stream.has_value()) {
-        const auto requested_stream = stream.value();
-        TORCH_CHECK(
-            requested_stream.device().is_cuda(),
-            "Provided stream must be a CUDA stream");
-        TORCH_CHECK(
-            requested_stream.device() == img1.device(),
-            "Stream and tensors must be on the same device");
-        cuda_stream = c10::cuda::CUDAStream(requested_stream).stream();
-    }
-
+    cudaStream_t cuda_stream) {
     constexpr int threads = 256;
     bool launched = false;
     int64_t batch_size = 1;
@@ -255,7 +254,7 @@ void blend_cuda(
             && is_aligned(img1.data_ptr<unsigned char>(), alignof(uchar4))
             && is_aligned(img2.data_ptr<unsigned char>(), alignof(uchar4))
             && is_aligned(output.data_ptr<unsigned char>(), alignof(uchar4))) {
-            blend_hwc_uchar4_kernel<<<blocks, threads, 0, cuda_stream>>>(
+            blend_hwc_uchar4_kernel<mode><<<blocks, threads, 0, cuda_stream>>>(
                 reinterpret_cast<const uchar4*>(img1.data_ptr<unsigned char>()),
                 reinterpret_cast<const uchar4*>(img2.data_ptr<unsigned char>()),
                 mask.data_ptr<unsigned char>(),
@@ -267,7 +266,7 @@ void blend_cuda(
             && is_aligned(img1.data_ptr<float>(), alignof(float4))
             && is_aligned(img2.data_ptr<float>(), alignof(float4))
             && is_aligned(output.data_ptr<float>(), alignof(float4))) {
-            blend_hwc_float4_kernel<<<blocks, threads, 0, cuda_stream>>>(
+            blend_hwc_float4_kernel<mode><<<blocks, threads, 0, cuda_stream>>>(
                 reinterpret_cast<const float4*>(img1.data_ptr<float>()),
                 reinterpret_cast<const float4*>(img2.data_ptr<float>()),
                 mask.data_ptr<float>(),
@@ -295,7 +294,7 @@ void blend_cuda(
             && is_aligned(img2.data_ptr<unsigned char>(), alignof(uchar4))
             && is_aligned(mask.data_ptr<unsigned char>(), alignof(uchar4))
             && is_aligned(output.data_ptr<unsigned char>(), alignof(uchar4))) {
-            blend_channel_first_uchar4_kernel<<<
+            blend_channel_first_uchar4_kernel<mode><<<
                 grid,
                 threads,
                 0,
@@ -318,7 +317,7 @@ void blend_cuda(
             && is_aligned(img2.data_ptr<float>(), alignof(float4))
             && is_aligned(mask.data_ptr<float>(), alignof(float4))
             && is_aligned(output.data_ptr<float>(), alignof(float4))) {
-            blend_channel_first_float4_kernel<<<
+            blend_channel_first_float4_kernel<mode><<<
                 grid,
                 threads,
                 0,
@@ -343,7 +342,7 @@ void blend_cuda(
                 if (metadata.layout == BlendLayout::HWC) {
                     const int blocks = static_cast<int>(
                         (metadata.numel + threads - 1) / threads);
-                    blend_hwc_kernel<scalar_t><<<
+                    blend_hwc_kernel<scalar_t, mode><<<
                         blocks,
                         threads,
                         0,
@@ -361,7 +360,7 @@ void blend_cuda(
                             (metadata.spatial_size + threads - 1) / threads),
                         static_cast<unsigned int>(metadata.channels),
                         static_cast<unsigned int>(batch_size));
-                    blend_channel_first_kernel<scalar_t><<<
+                    blend_channel_first_kernel<scalar_t, mode><<<
                         grid,
                         threads,
                         0,
@@ -378,6 +377,50 @@ void blend_cuda(
             });
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void blend_cuda(
+    const torch::Tensor& img1,
+    const torch::Tensor& img2,
+    const torch::Tensor& mask,
+    torch::Tensor& output,
+    const BlendMetadata& metadata,
+    float max_value,
+    BlendMode blend_mode,
+    c10::optional<torch::Stream> stream) {
+    cudaStream_t cuda_stream =
+        c10::cuda::getCurrentCUDAStream(img1.device().index());
+    if (stream.has_value()) {
+        const auto requested_stream = stream.value();
+        TORCH_CHECK(
+            requested_stream.device().is_cuda(),
+            "Provided stream must be a CUDA stream");
+        TORCH_CHECK(
+            requested_stream.device() == img1.device(),
+            "Stream and tensors must be on the same device");
+        cuda_stream = c10::cuda::CUDAStream(requested_stream).stream();
+    }
+
+    switch (blend_mode) {
+        case BlendMode::Linear:
+            launch_blend_cuda<BlendMode::Linear>(
+                img1, img2, mask, output, metadata, max_value, cuda_stream);
+            break;
+        case BlendMode::Multiply:
+            launch_blend_cuda<BlendMode::Multiply>(
+                img1, img2, mask, output, metadata, max_value, cuda_stream);
+            break;
+        case BlendMode::Screen:
+            launch_blend_cuda<BlendMode::Screen>(
+                img1, img2, mask, output, metadata, max_value, cuda_stream);
+            break;
+        case BlendMode::Overlay:
+            launch_blend_cuda<BlendMode::Overlay>(
+                img1, img2, mask, output, metadata, max_value, cuda_stream);
+            break;
+    }
 
     if (!stream.has_value()) {
         C10_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));

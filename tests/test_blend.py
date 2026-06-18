@@ -4,13 +4,39 @@ import warnings
 from torch_blend import ImageBlender
 
 
-def blend_reference_float(img1, img2, mask, device='cpu', layout='HWC'):
+def blend_reference_float(
+    img1,
+    img2,
+    mask,
+    device='cpu',
+    layout='HWC',
+    mode='linear',
+):
     """Compute the expected blend in float32 on the requested device."""
     img1_d = img1.to(device).float()
     img2_d = img2.to(device).float()
     mask_d = mask.to(device).float()
     
     max_val = 255.0 if img1.dtype == torch.uint8 else 1.0
+    if mode in {'linear', 'normal'}:
+        mode_result = img1_d
+    elif mode == 'multiply':
+        mode_result = img1_d * img2_d / max_val
+    elif mode == 'screen':
+        mode_result = max_val - (
+            (max_val - img1_d) * (max_val - img2_d) / max_val
+        )
+    elif mode == 'overlay':
+        mode_result = torch.where(
+            img2_d <= max_val * 0.5,
+            2.0 * img1_d * img2_d / max_val,
+            max_val - (
+                2.0 * (max_val - img1_d) * (max_val - img2_d) / max_val
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported reference blend mode: {mode}")
+
     alpha = mask_d / max_val
     if layout == 'HWC':
         alpha = alpha.unsqueeze(-1)
@@ -25,7 +51,7 @@ def blend_reference_float(img1, img2, mask, device='cpu', layout='HWC'):
             alpha = alpha.unsqueeze(1)
     beta = 1.0 - alpha
     
-    return img1_d * alpha + img2_d * beta
+    return mode_result * alpha + img2_d * beta
 
 
 class TestCoreFunctionality:
@@ -371,6 +397,164 @@ class TestVectorizedCuda:
             torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
 
 
+class TestBlendModes:
+    """Verify advanced blend mode formulas and alpha compositing semantics."""
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["linear", "normal", "multiply", "screen", "overlay"],
+    )
+    def test_float32_modes_cpu(self, mode):
+        """Verify every blend mode against the float32 reference."""
+        img1 = torch.rand((6, 7, 3), dtype=torch.float32)
+        img2 = torch.rand((6, 7, 3), dtype=torch.float32)
+        mask = torch.rand((6, 7), dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(img1, img2, mask, mode=mode)
+
+        torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.parametrize("mode", ["multiply", "screen", "overlay"])
+    def test_uint8_mode_formulas(self, mode):
+        """Verify uint8 mode output when the mask is fully opaque."""
+        img1 = torch.tensor([[[64], [192]]], dtype=torch.uint8)
+        img2 = torch.tensor([[[96], [224]]], dtype=torch.uint8)
+        mask = torch.full((1, 2), 255, dtype=torch.uint8)
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            mode=mode,
+        ).to(torch.uint8)
+
+        torch.testing.assert_close(
+            result.float(),
+            expected.float(),
+            rtol=0,
+            atol=1,
+        )
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["linear", "multiply", "screen", "overlay"],
+    )
+    def test_mode_mask_boundaries(self, mode):
+        """Verify mask zero returns img2 and full mask returns the mode result."""
+        img1 = torch.tensor([[[0.2], [0.8]]], dtype=torch.float32)
+        img2 = torch.tensor([[[0.7], [0.3]]], dtype=torch.float32)
+        mask = torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(img1, img2, mask, mode=mode)
+
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(result[:, :1], img2[:, :1])
+
+    @pytest.mark.parametrize("mode", ["multiply", "screen", "overlay"])
+    def test_bchw_modes(self, mode):
+        """Verify advanced modes for batched channel-first tensors."""
+        img1 = torch.rand((2, 3, 4, 5), dtype=torch.float32)
+        img2 = torch.rand((2, 3, 4, 5), dtype=torch.float32)
+        mask = torch.rand((2, 4, 5), dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            layout='BCHW',
+            mode=mode,
+        )
+
+        torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.parametrize("mode", ["multiply", "screen", "overlay"])
+    def test_float16_modes_cpu(self, mode):
+        """Verify advanced modes through the float16 CPU scalar path."""
+        img1 = torch.rand((3, 4, 5), dtype=torch.float16)
+        img2 = torch.rand((3, 4, 5), dtype=torch.float16)
+        mask = torch.rand((4, 5), dtype=torch.float16)
+
+        result = ImageBlender.blend(
+            img1,
+            img2,
+            mask,
+            layout='CHW',
+            mode=mode,
+        )
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            layout='CHW',
+            mode=mode,
+        )
+
+        torch.testing.assert_close(
+            result.float(),
+            expected,
+            rtol=0,
+            atol=1e-3,
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("mode", ["multiply", "screen", "overlay"])
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+    def test_vectorized_cuda_modes(self, mode, dtype):
+        """Verify advanced modes through the HWC vectorized CUDA kernels."""
+        shape = (12, 16, 4)
+        if dtype == torch.uint8:
+            img1 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            img2 = torch.randint(0, 256, shape, dtype=dtype, device='cuda')
+            mask = torch.randint(0, 256, (12, 16), dtype=dtype, device='cuda')
+        else:
+            img1 = torch.rand(shape, dtype=dtype, device='cuda')
+            img2 = torch.rand(shape, dtype=dtype, device='cuda')
+            mask = torch.rand((12, 16), dtype=dtype, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            device='cuda',
+            mode=mode,
+        )
+
+        if dtype == torch.uint8:
+            torch.testing.assert_close(
+                result.float(),
+                expected.to(dtype).float(),
+                rtol=0,
+                atol=1,
+            )
+        else:
+            torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("mode", ["multiply", "screen", "overlay"])
+    def test_bchw_vectorized_cuda_modes(self, mode):
+        """Verify advanced modes through the BCHW float4 CUDA kernel."""
+        img1 = torch.rand((2, 3, 8, 12), dtype=torch.float32, device='cuda')
+        img2 = torch.rand_like(img1)
+        mask = torch.rand((2, 8, 12), dtype=torch.float32, device='cuda')
+
+        result = ImageBlender.blend(img1, img2, mask, mode=mode)
+        expected = blend_reference_float(
+            img1,
+            img2,
+            mask,
+            device='cuda',
+            layout='BCHW',
+            mode=mode,
+        )
+
+        torch.testing.assert_close(result, expected, rtol=0, atol=1e-6)
+
+
 class TestInputValidation:
     """Verify that invalid tensor and stream inputs are rejected."""
 
@@ -463,6 +647,20 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="BCHW masks must have shape"):
             ImageBlender.blend(img1, img2, mask)
+
+    def test_invalid_blend_mode(self, sample_tensors):
+        """Reject unknown blend mode names."""
+        img1, img2, mask = sample_tensors
+
+        with pytest.raises(ValueError, match="Mode must be one of"):
+            ImageBlender.blend(img1, img2, mask, mode="difference")
+
+    def test_invalid_blend_mode_type(self, sample_tensors):
+        """Reject non-string blend mode values."""
+        img1, img2, mask = sample_tensors
+
+        with pytest.raises(TypeError, match="Mode must be a string"):
+            ImageBlender.blend(img1, img2, mask, mode=1)
 
 
 class TestMultiDtype:

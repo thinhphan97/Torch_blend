@@ -13,6 +13,7 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 - **Batch Processing**: Applies shared or per-sample masks to an entire image or feature-map batch.
 - **Layout-Specific CUDA Kernels**: Uses a coalesced linear kernel for `HWC` and maps `BCHW` batches to `gridDim.z`, channels to `gridDim.y`, and spatial pixels to `threadIdx.x`.
 - **Vectorized CUDA Access**: Uses `uchar4` and `float4` fast paths when tensor layout, alignment, and spatial dimensions permit four-value memory transactions.
+- **Advanced Blend Modes**: Supports linear, multiply, screen, and overlay operations with mask-controlled compositing.
 - **Edge-Case Handling**: Preserves output metadata and safely handles empty spatial dimensions.
 - **Pythonic API**: Comes with a clean, typed Python wrapper with full docstrings and IDE autocomplete support.
 
@@ -29,6 +30,7 @@ torch_blend_package/
 │       ├── bindings.cpp     # Pybind11 module definition
 │       ├── blend.h          # Native extension public declarations
 │       ├── blend_common.h   # Shared layout metadata and index helpers
+│       ├── blend_modes.h    # Shared CPU/CUDA blend mode formulas
 │       ├── blend.cpp        # Device dispatcher and common validation
 │       ├── blend_cpu.cpp    # CPU backend
 │       └── blend_cuda.cu    # CUDA kernel and CUDA backend
@@ -102,8 +104,8 @@ pip install dist/torch_blend-*.whl
 
 The test suite covers deterministic and randomized blending, CPU/CUDA execution,
 custom streams, supported dtypes and channel counts, non-contiguous tensors,
-empty inputs, `HWC`/`CHW`/`BCHW` layouts, batch masks, output metadata, and
-input validation.
+empty inputs, `HWC`/`CHW`/`BCHW` layouts, batch masks, advanced blend modes,
+output metadata, and input validation.
 
 ```bash
 conda activate torch_blend_env
@@ -160,6 +162,7 @@ result_async = ImageBlender.blend(
     img2.half(),
     mask.half(),
     stream=my_stream,
+    mode="screen",
 )
 
 # Explicitly wait for the GPU to finish
@@ -189,15 +192,16 @@ with warnings.catch_warnings(record=True) as w:
 
 ## 📖 API Reference
 
-### `ImageBlender.blend(img1, img2, mask, stream=None, layout=None)`
+### `ImageBlender.blend(img1, img2, mask, stream=None, layout=None, mode="linear")`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `img1` | `torch.Tensor` | Background image or feature map. Shape: `(H, W, C)`, `(C, H, W)`, or `(B, C, H, W)`. |
-| `img2` | `torch.Tensor` | Foreground image. Must match `img1`'s shape and dtype. |
+| `img1` | `torch.Tensor` | Source or blend layer. Shape: `(H, W, C)`, `(C, H, W)`, or `(B, C, H, W)`. |
+| `img2` | `torch.Tensor` | Base layer returned where the mask is zero. Must match `img1`'s shape and dtype. |
 | `mask` | `torch.Tensor` | Spatial mask. BCHW inputs accept `(H, W)`, `(B, H, W)`, or `(B, 1, H, W)`. |
 | `stream` | `Optional[torch.cuda.Stream]` | If `None`, CUDA execution is synchronous. If provided, execution is asynchronous on that exact stream. Ignored for CPU tensors. |
 | `layout` | `Optional[str]` | Explicitly selects `HWC`, `CHW`, `BCHW`, or `NCHW`. Usually inferred from image and mask shapes. |
+| `mode` | `str` | Blend operation: `linear`, `normal`, `multiply`, `screen`, or `overlay`. |
 
 **Returns:** A contiguous tensor with shape, dtype, and device matching `img1`.
 Empty spatial dimensions return an empty tensor.
@@ -215,6 +219,53 @@ Empty spatial dimensions return an empty tensor.
 Invalid shapes, devices, or mixed dtypes raise `ValueError`. Unsupported dtypes
 and invalid CUDA stream objects raise `TypeError`.
 
+## Blend Modes
+
+The selected mode is evaluated first and then composited over `img2` using the
+mask:
+
+```text
+mode_result = apply_mode(img1, img2)
+output = mode_result * alpha + img2 * (1 - alpha)
+```
+
+This preserves the existing mask behavior:
+
+- A zero mask returns `img2`.
+- A fully opaque mask returns the selected mode result.
+- `linear` and `normal` preserve the original linear blend behavior.
+
+For `max_val = 255` with `uint8` and `max_val = 1` with floating-point tensors:
+
+```text
+linear:
+    mode_result = img1
+
+multiply:
+    mode_result = img1 * img2 / max_val
+
+screen:
+    mode_result = max_val - ((max_val - img1) * (max_val - img2) / max_val)
+
+overlay:
+    if img2 <= max_val / 2:
+        mode_result = 2 * img1 * img2 / max_val
+    else:
+        mode_result = max_val - 2 * (max_val - img1) * (max_val - img2) / max_val
+```
+
+`overlay` treats `img2` as the base layer when selecting its lower or upper
+formula branch.
+
+```python
+result = ImageBlender.blend(
+    img1,
+    img2,
+    mask,
+    mode="screen",
+)
+```
+
 ## Native Extension Architecture
 
 - `bindings.cpp` exposes the native dispatcher to Python and contains no kernel logic.
@@ -222,6 +273,7 @@ and invalid CUDA stream objects raise `TypeError`.
 - `blend_cpu.cpp` contains only the CPU implementation.
 - `blend_cuda.cu` contains only CUDA stream handling, kernel launch, and CUDA execution.
 - `blend_common.h` owns layout metadata and mask-index calculation shared by CPU and CUDA.
+- `blend_modes.h` contains compile-time blend mode formulas shared by CPU and CUDA.
 - `blend.h` defines the internal extension interface between translation units.
 
 For channel-first tensors, CUDA uses `gridDim.z` rather than `blockDim.z` for

@@ -14,5 +14,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("mask_is_batched"),
         py::arg("height"),
         py::arg("width"),
+        py::arg("blend_mode"),
         py::arg("stream") = py::none());
 }
