@@ -1,6 +1,6 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
-#include <vector>
 
 // KERNEL CUDA
 template <typename scalar_t>
@@ -43,6 +43,9 @@ torch::Tensor blend_dispatcher(
 
     // Allocate output tensor
     torch::Tensor output = torch::empty_like(img1);
+    if (output.numel() == 0) {
+        return output;
+    }
 
     dim3 blockDim(16, 16);
     dim3 gridDim((width + blockDim.x - 1) / blockDim.x, (height + blockDim.y - 1) / blockDim.y);
@@ -55,12 +58,12 @@ torch::Tensor blend_dispatcher(
     if (img1.is_cuda()) {
         TORCH_CHECK(img2.is_cuda() && mask.is_cuda(), "All tensors must be on the same CUDA device");
         
-        cudaStream_t cuda_stream = 0;
+        cudaStream_t cuda_stream = c10::cuda::getCurrentCUDAStream(img1.device().index());
         if (stream_opt.has_value()) {
             auto stream = stream_opt.value();
             TORCH_CHECK(stream.device().is_cuda(), "Provided stream must be a CUDA stream.");
             TORCH_CHECK(stream.device() == img1.device(), "Stream and Tensors must be on the same device!");
-            cuda_stream = c10::cuda::getCurrentCUDAStream(stream.device().index());
+            cuda_stream = c10::cuda::CUDAStream(stream).stream();
         }
 
         AT_DISPATCH_ALL_TYPES_AND(at::ScalarType::Half, img1.scalar_type(), "blend_images_kernel", [&] {
@@ -72,9 +75,10 @@ torch::Tensor blend_dispatcher(
                 width, height, channels, max_val
             );
         });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
 
         if (!stream_opt.has_value()) {
-            cudaStreamSynchronize(cuda_stream);
+            C10_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
         }
         
     } 

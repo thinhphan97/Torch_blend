@@ -21,21 +21,30 @@ class ImageBlender:
         Blends two images using a mask. Supports CPU and CUDA, with multi-dtype capabilities.
         
         Args:
-            img1 (torch.Tensor): Background image. Shape: (H, W, C). 
-                Dtype: uint8, float32, or float16. (If float, values should be in [0.0, 1.0]).
+            img1 (torch.Tensor): Background image with shape (H, W, C).
+                Supported dtypes are uint8, float16, and float32.
             img2 (torch.Tensor): Foreground image. Must match img1's shape and dtype.
             mask (torch.Tensor): Grayscale mask. Shape: (H, W). Must match img1's dtype.
+                uint8 masks use 255 as full opacity. Floating-point masks use 1.0;
+                values outside [0.0, 1.0] perform linear extrapolation.
             stream (Optional[torch.cuda.Stream], optional): 
                 If None: Execution is SYNCHRONOUS (blocks CPU until GPU finishes).
                 If stream provided: Execution is ASYNCHRONOUS (returns immediately).
-                Ignored for CPU tensors. Defaults to None.
+                The supplied stream is used directly and does not need to be the
+                current stream. Ignored for CPU tensors. Defaults to None.
             
         Returns:
-            torch.Tensor: The blended image. Shape: (H, W, C). Dtype matches the input tensors.
+            torch.Tensor: A contiguous blended image with shape (H, W, C).
+                Dtype and device match the input tensors. Empty spatial inputs
+                return an empty tensor with matching metadata.
             
         Raises:
             ValueError: If tensors are not on the same device, have mismatched shapes, or mismatched dtypes.
-            TypeError: If stream is not a torch.cuda.Stream instance.
+            TypeError: If the dtype is unsupported or stream is not a torch.cuda.Stream instance.
+
+        Notes:
+            Non-contiguous inputs are converted to contiguous tensors before the
+            native CPU or CUDA implementation is called.
             
         Example (Sync - uint8):
             >>> img1 = torch.randint(0, 255, (1080, 1920, 3), dtype=torch.uint8)
@@ -48,6 +57,8 @@ class ImageBlender:
             >>> # Do other CPU work...
             >>> my_stream.synchronize() # Wait when needed
         """
+        supported_dtypes = {torch.uint8, torch.float16, torch.float32}
+
         # Validate devices
         if img1.device != img2.device or img1.device != mask.device:
             raise ValueError("All tensors must be located on the same device.")
@@ -61,6 +72,11 @@ class ImageBlender:
             raise ValueError(f"Mask spatial shape must match images. Got {mask.shape} for images of shape {img1.shape[:2]}")
         if img1.dtype != img2.dtype or img1.dtype != mask.dtype:
             raise ValueError(f"All tensors must have the same dtype. Got {img1.dtype}, {img2.dtype}, {mask.dtype}")
+        if img1.dtype not in supported_dtypes:
+            raise TypeError(
+                f"Unsupported dtype {img1.dtype}. "
+                "Supported dtypes are torch.uint8, torch.float16, and torch.float32."
+            )
             
         is_cpu = img1.is_cpu
         
@@ -76,5 +92,10 @@ class ImageBlender:
             elif not isinstance(stream, torch.cuda.Stream):
                 raise TypeError("Stream must be an instance of torch.cuda.Stream or None.")
                 
-        # Call the underlying C++ extension
-        return torch_blend_cuda.blend(img1, img2, mask, stream)
+        # The native implementation operates on contiguous HWC/HW memory.
+        return torch_blend_cuda.blend(
+            img1.contiguous(),
+            img2.contiguous(),
+            mask.contiguous(),
+            stream,
+        )

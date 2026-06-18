@@ -5,10 +5,12 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 
 ## ✨ Features
 
-- **Multi-Dtype Support**: Natively supports `uint8`, `float32`, and `float16` tensors. Automatically normalizes mask values based on dtype (255 for uint8, 1.0 for floats).
-- **Zero-copy Tensor Operations**: Directly accesses PyTorch tensor memory pointers for maximum performance using PyTorch's `AT_DISPATCH` macros.
-- **Auto Sync/Async**: Automatically runs synchronously if no stream is provided, and asynchronously if a `torch.cuda.Stream` is provided.
+- **Multi-Dtype Support**: Supports `uint8`, `float32`, and `float16` tensors on CPU and CUDA. Other dtypes are rejected explicitly.
+- **Contiguous Native Operations**: Directly accesses PyTorch tensor memory for contiguous inputs. Non-contiguous inputs are converted automatically before dispatch.
+- **Auto Sync/Async**: Runs synchronously if no stream is provided and asynchronously on the exact `torch.cuda.Stream` passed by the caller.
 - **Device-Aware**: Falls back to a pure C++ CPU loop if tensors are on CPU, with friendly warnings if streams are misused.
+- **Flexible Image Layout**: Supports HWC images with one or more channels, including grayscale, RGB, and RGBA.
+- **Edge-Case Handling**: Preserves output metadata and safely handles empty spatial dimensions.
 - **Pythonic API**: Comes with a clean, typed Python wrapper with full docstrings and IDE autocomplete support.
 
 ## 📦 Project Structure
@@ -16,7 +18,6 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 ```text
 torch_blend_package/
 ├── setup.py                 # Build configuration using torch.utils.cpp_extension
-├── pytest.ini               # Pytest configuration
 ├── README.md
 ├── torch_blend/             # Source code
 │   ├── __init__.py
@@ -33,9 +34,9 @@ torch_blend_package/
 
 ### 1. Prerequisites (Conda Environment Setup)
 
-> **⚠️ CRITICAL NOTE:** To build PyTorch C++/CUDA extensions successfully, the CUDA version used by **PyTorch** must exactly match the CUDA version of the **NVCC compiler** (`cuda-toolkit`). 
+> **⚠️ CRITICAL NOTE:** To build PyTorch C++/CUDA extensions successfully, the CUDA version used by **PyTorch** must match the CUDA version of the **NVCC compiler** (`cuda-toolkit`).
 
-Create a Conda environment and install both PyTorch and the CUDA toolkit from the `nvidia` channel to ensure versions match. In this example, we use **CUDA 12.1**:
+Create a Conda environment and install matching PyTorch and CUDA toolkit versions. This example uses **CUDA 12.8**:
 
 ```bash
 # Create and activate conda environment
@@ -57,6 +58,8 @@ Verify that `nvcc` and PyTorch CUDA versions match:
 nvcc --version
 python -c "import torch; print(torch.version.cuda)"
 ```
+
+If the versions differ, the extension build fails with a CUDA version mismatch.
 
 ### 2. Building the Package
 
@@ -89,9 +92,12 @@ pip install dist/torch_blend-*.whl
 
 ## 🧪 Running Tests
 
-The project includes a comprehensive `pytest` suite to verify mathematical correctness, async/sync behaviors, multi-dtype support, and input validation.
+The test suite covers deterministic and randomized blending, CPU/CUDA execution,
+custom streams, supported dtypes and channel counts, non-contiguous tensors,
+empty inputs, output metadata, and input validation.
 
 ```bash
+conda activate torch_blend_env
 pytest tests/ -v
 ```
 
@@ -123,24 +129,27 @@ cv2.imwrite("result_sync.jpg", result.cpu().numpy())
 ```
 
 ### 2. Deep Learning Pipeline (float32 / float16)
-Tensors are automatically normalized. If you pass `float32` or `float16` tensors, the mask is expected to be in the `[0.0, 1.0]` range.
+Floating-point images and masks are interpreted directly; they are not normalized
+by the package. For standard alpha blending, use values in `[0.0, 1.0]`.
+Mask values outside this range are allowed and perform linear extrapolation.
 
 ```python
 import torch
 from torch_blend import ImageBlender
 
-# Assume img1, img2, mask are float32 tensors in range [0.0, 1.0]
-# Shape: (H, W, C) or (H, W, 1) -> (H, W) for mask
+# Assume img1 and img2 have shape (H, W, C).
+# The mask must have shape (H, W).
 
 # Asynchronous Blend on GPU using float16 (half precision) for speed
 my_stream = torch.cuda.Stream()
 
-with torch.cuda.stream(my_stream):
-    # Returns immediately, GPU works in the background
-    result_async = ImageBlender.blend(img1.half().cuda(), 
-                                      img2.half().cuda(), 
-                                      mask.half().cuda(), 
-                                      stream=my_stream)
+# The stream is used directly, even outside a stream context manager.
+result_async = ImageBlender.blend(
+    img1.half().cuda(),
+    img2.half().cuda(),
+    mask.half().cuda(),
+    stream=my_stream,
+)
 
 # Explicitly wait for the GPU to finish
 my_stream.synchronize()
@@ -175,10 +184,22 @@ with warnings.catch_warnings(record=True) as w:
 |-----------|------|-------------|
 | `img1` | `torch.Tensor` | Background image. Shape: `(H, W, C)`. Dtype: `uint8`, `float32`, or `float16`. |
 | `img2` | `torch.Tensor` | Foreground image. Must match `img1`'s shape and dtype. |
-| `mask` | `torch.Tensor` | Grayscale mask. Shape: `(H, W)`. Must match `img1`'s dtype. |
-| `stream` | `Optional[torch.cuda.Stream]` | If `None`, execution is **Synchronous**. If stream provided, execution is **Asynchronous**. Ignored for CPU tensors. |
+| `mask` | `torch.Tensor` | Mask with shape `(H, W)` and the same dtype as the images. Full opacity is `255` for `uint8` and `1.0` for floating-point tensors. |
+| `stream` | `Optional[torch.cuda.Stream]` | If `None`, CUDA execution is synchronous. If provided, execution is asynchronous on that exact stream. Ignored for CPU tensors. |
 
-**Returns:** `torch.Tensor` - The blended image. Shape: `(H, W, C)`. Dtype matches the input tensors.
+**Returns:** A contiguous tensor with shape, dtype, and device matching `img1`.
+Empty spatial dimensions return an empty tensor.
+
+### Input Requirements
+
+- All tensors must use the same device and dtype.
+- Images must have shape `(H, W, C)`; masks must have shape `(H, W)`.
+- Supported dtypes are `torch.uint8`, `torch.float16`, and `torch.float32`.
+- Non-contiguous tensors are accepted and converted internally.
+- Floating-point mask values outside `[0.0, 1.0]` are not clamped.
+
+Invalid shapes, devices, or mixed dtypes raise `ValueError`. Unsupported dtypes
+and invalid CUDA stream objects raise `TypeError`.
 
 ## License
 MIT License

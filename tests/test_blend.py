@@ -51,6 +51,67 @@ class TestCoreFunctionality:
         assert torch.all(result[:, :result.shape[1]//2] == 200), "Failed at mask=0"
         assert torch.all(result[:, result.shape[1]//2:] == 100), "Failed at mask=255"
 
+    def test_deterministic_small_input(self):
+        """Verify exact output for a small input with fixed values."""
+        img1 = torch.tensor([[[0], [100]], [[200], [255]]], dtype=torch.uint8)
+        img2 = torch.tensor([[[255], [200]], [[100], [0]]], dtype=torch.uint8)
+        mask = torch.tensor([[0, 255], [128, 64]], dtype=torch.uint8)
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask).to(torch.uint8)
+
+        assert torch.equal(result, expected)
+
+    @pytest.mark.parametrize("channels", [1, 3, 4])
+    def test_supported_channel_counts(self, channels):
+        """Verify blending for grayscale, RGB, and RGBA channel counts."""
+        img1 = torch.full((4, 5, channels), 40, dtype=torch.uint8)
+        img2 = torch.full((4, 5, channels), 200, dtype=torch.uint8)
+        mask = torch.full((4, 5), 128, dtype=torch.uint8)
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask).to(torch.uint8)
+
+        assert torch.equal(result, expected)
+
+    def test_output_properties(self, sample_tensors):
+        """Verify that output preserves shape, dtype, device, and contiguity."""
+        img1, img2, mask = sample_tensors
+
+        result = ImageBlender.blend(img1, img2, mask)
+
+        assert result.shape == img1.shape
+        assert result.dtype == img1.dtype
+        assert result.device == img1.device
+        assert result.is_contiguous()
+
+    def test_non_contiguous_inputs(self, sample_tensors):
+        """Verify that non-contiguous images and masks are blended correctly."""
+        img1, img2, mask = sample_tensors
+        img1 = img1.transpose(0, 1)
+        img2 = img2.transpose(0, 1)
+        mask = mask.transpose(0, 1)
+        assert not img1.is_contiguous()
+        assert not img2.is_contiguous()
+        assert not mask.is_contiguous()
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask).to(torch.uint8)
+
+        assert torch.equal(result, expected)
+
+    @pytest.mark.parametrize("shape", [(0, 4, 3), (4, 0, 3)])
+    def test_empty_images(self, shape):
+        """Verify that empty spatial dimensions return an empty output."""
+        img1 = torch.empty(shape, dtype=torch.uint8)
+        img2 = torch.empty(shape, dtype=torch.uint8)
+        mask = torch.empty(shape[:2], dtype=torch.uint8)
+
+        result = ImageBlender.blend(img1, img2, mask)
+
+        assert result.shape == img1.shape
+        assert result.numel() == 0
+
 
 class TestStreamAndAsync:
     """Verify CUDA stream handling and CPU stream fallback behavior."""
@@ -76,6 +137,23 @@ class TestStreamAndAsync:
             atol=1,
             msg="GPU async blend output mismatch",
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_gpu_stream_argument_outside_context(self):
+        """Verify that the supplied CUDA stream is used outside its context manager."""
+        img1 = torch.zeros((8, 8, 3), dtype=torch.float32, device="cuda")
+        img2 = torch.zeros_like(img1)
+        mask = torch.ones((8, 8), dtype=torch.float32, device="cuda")
+        stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            img1.fill_(1.0)
+
+        result = ImageBlender.blend(img1, img2, mask, stream=stream)
+        stream.synchronize()
+
+        assert torch.equal(result, torch.ones_like(result))
 
     def test_cpu_stream_warning(self, sample_tensors):
         """Verify that CPU blending ignores a stream and emits a warning."""
@@ -141,6 +219,35 @@ class TestInputValidation:
         with pytest.raises(TypeError, match="Stream must be an instance of torch.cuda.Stream"):
             ImageBlender.blend(img1_gpu, img2_gpu, mask_gpu, stream="invalid_stream_string")
 
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float64])
+    def test_unsupported_dtype(self, dtype):
+        """Reject dtypes outside uint8, float16, and float32."""
+        img1 = torch.zeros((4, 4, 3), dtype=dtype)
+        img2 = torch.zeros_like(img1)
+        mask = torch.zeros((4, 4), dtype=dtype)
+
+        with pytest.raises(TypeError, match="Unsupported dtype"):
+            ImageBlender.blend(img1, img2, mask)
+
+    @pytest.mark.parametrize("shape", [(4, 4), (1, 4, 4, 3)])
+    def test_invalid_image_dimensions(self, shape):
+        """Reject images that are not three-dimensional HWC tensors."""
+        img1 = torch.zeros(shape, dtype=torch.uint8)
+        img2 = torch.zeros_like(img1)
+        mask = torch.zeros((4, 4), dtype=torch.uint8)
+
+        with pytest.raises(ValueError, match="Images must be 3D"):
+            ImageBlender.blend(img1, img2, mask)
+
+    def test_mask_spatial_shape_mismatch(self):
+        """Reject a two-dimensional mask with incorrect spatial dimensions."""
+        img1 = torch.zeros((4, 5, 3), dtype=torch.uint8)
+        img2 = torch.zeros_like(img1)
+        mask = torch.zeros((4, 4), dtype=torch.uint8)
+
+        with pytest.raises(ValueError, match="Mask spatial shape must match"):
+            ImageBlender.blend(img1, img2, mask)
+
 
 class TestMultiDtype:
     """Verify blending behavior across supported tensor dtypes."""
@@ -167,6 +274,43 @@ class TestMultiDtype:
         result = ImageBlender.blend(img1_h, img2_h, mask_h)
         expected = blend_reference_float(img1_h, img2_h, mask_h, device='cuda')
         assert torch.allclose(result.float(), expected, atol=1e-3), "Float16 GPU blend output mismatch"
+
+    def test_float16_cpu_blend(self, sample_tensors):
+        """Verify normalized float16 CPU blending."""
+        img1, img2, mask = sample_tensors
+        img1 = (img1.float() / 255.0).half()
+        img2 = (img2.float() / 255.0).half()
+        mask = (mask.float() / 255.0).half()
+
+        result = ImageBlender.blend(img1, img2, mask)
+        expected = blend_reference_float(img1, img2, mask)
+
+        torch.testing.assert_close(result.float(), expected, rtol=0, atol=1e-3)
+
+    def test_float_mask_extrapolation(self):
+        """Verify that float masks outside [0, 1] perform linear extrapolation."""
+        img1 = torch.ones((1, 2, 1), dtype=torch.float32)
+        img2 = torch.zeros_like(img1)
+        mask = torch.tensor([[-0.5, 1.5]], dtype=torch.float32)
+
+        result = ImageBlender.blend(img1, img2, mask)
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[[-0.5], [1.5]]], dtype=torch.float32),
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_output_properties(self, sample_tensors):
+        """Verify that CUDA output preserves shape, dtype, device, and contiguity."""
+        img1, img2, mask = (tensor.cuda() for tensor in sample_tensors)
+
+        result = ImageBlender.blend(img1, img2, mask)
+
+        assert result.shape == img1.shape
+        assert result.dtype == img1.dtype
+        assert result.device == img1.device
+        assert result.is_contiguous()
 
     def test_dtype_mismatch_tensors(self, sample_tensors):
         """Reject inputs when the second image has a mismatched dtype."""
