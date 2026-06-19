@@ -84,3 +84,4 @@ Thumbs.db
 
 .env
 config_local.ini
+benchmark_results/

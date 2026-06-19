@@ -250,6 +250,73 @@ conda activate torch_blend_env
 pytest tests/ -v
 ```
 
+## 📊 Performance Benchmarks
+
+`benchmarks/benchmark.py` compares Torch Blend with:
+
+- `cv2.addWeighted` for CPU, HWC, single-image inputs.
+- Pure PyTorch using `img1 * alpha + img2 * (1 - alpha)`.
+
+Every run records the input shape, layout, dtype, channel count, batch size,
+latency distribution, FPS, megapixels per second, estimated memory bandwidth,
+speedup against PyTorch, and maximum correctness error. CUDA cases synchronize
+before and after every measured call so asynchronous kernel launches are not
+reported as completed work.
+
+Install the benchmark dependencies:
+
+```bash
+pip install -e ".[benchmark]"
+```
+
+Run the default CPU and CUDA matrix:
+
+```bash
+python benchmarks/benchmark.py
+```
+
+Run a short CPU smoke benchmark:
+
+```bash
+python benchmarks/benchmark.py \
+    --devices cpu \
+    --sizes 256p \
+    --layouts HWC \
+    --dtypes uint8 float32 \
+    --channels 3 4 \
+    --warmup 3 \
+    --runs 10
+```
+
+Run selected CUDA and 4K cases:
+
+```bash
+python benchmarks/benchmark.py \
+    --devices cuda \
+    --sizes 1080p 4k \
+    --layouts HWC CHW \
+    --dtypes float16 float32 \
+    --channels 3 4 \
+    --warmup 30 \
+    --runs 200
+```
+
+Custom dimensions use `WIDTHxHEIGHT`, for example `--sizes 640x480 1920x1080`.
+Results are written to a timestamped directory:
+
+```text
+benchmark_results/2026-06-19_153000/
+├── report.md          # Human-readable system and benchmark report
+├── results.csv        # Spreadsheet-friendly per-case results
+├── results.json       # Machine-readable per-case results
+├── system.json        # Full hardware, toolchain, and dependency metadata
+└── requirements.txt   # Installed benchmark dependency versions
+```
+
+Unavailable backends are retained as `skipped` or `failed` rows with a reason.
+For example, CUDA cases are not silently omitted when the NVIDIA driver is
+unavailable or the local CUDA toolchain is incompatible.
+
 ## 🚀 Usage & Examples
 
 ### 1. Standard Image Blending (uint8 - OpenCV Style)

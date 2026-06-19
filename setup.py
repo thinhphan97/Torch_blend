@@ -12,6 +12,12 @@ setup(
     },
     include_package_data=True,
     zip_safe=False,
+    extras_require={
+        "benchmark": [
+            "numpy",
+            "opencv-python-headless",
+        ],
+    },
     ext_modules=[
         CUDAExtension(
             name="torch_blend._torch_blend_cuda",
