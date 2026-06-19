@@ -1,7 +1,8 @@
 import torch
 import warnings
 from typing import Optional
-import torch_blend._torch_blend_cuda as torch_blend_cuda
+
+from ._extension import get_extension
 
 
 class ImageBlender:
@@ -173,7 +174,7 @@ class ImageBlender:
             elif not isinstance(stream, torch.cuda.Stream):
                 raise TypeError("Stream must be an instance of torch.cuda.Stream or None.")
 
-        return torch_blend_cuda.blend(
+        return get_extension().blend(
             img1.contiguous(),
             img2.contiguous(),
             mask.contiguous(),

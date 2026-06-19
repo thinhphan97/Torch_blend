@@ -21,11 +21,16 @@ This package provides a custom PyTorch operator that runs natively on CUDA (with
 
 ```text
 torch_blend_package/
+├── MANIFEST.in              # Includes native sources in source distributions
 ├── setup.py                 # Build configuration using torch.utils.cpp_extension
 ├── README.md
+├── scripts/
+│   └── test_jit_build.py    # Forced JIT build and CUDA smoke test
 ├── torch_blend/             # Source code
 │   ├── __init__.py
+│   ├── _extension.py        # Binary-first lazy JIT loader
 │   ├── blend_module.py      # Python wrapper (Type hints, validation)
+│   ├── environment.py       # JIT configuration and toolchain validation
 │   └── ext/
 │       ├── bindings.cpp     # Pybind11 module definition
 │       ├── blend.h          # Native extension public declarations
@@ -37,7 +42,8 @@ torch_blend_package/
 └── tests/                   # Unit tests
     ├── __init__.py
     ├── conftest.py          # Pytest fixtures
-    └── test_blend.py        # Test cases (including Multi-Dtype tests)
+    ├── test_blend.py        # Blend correctness and validation tests
+    └── test_jit.py          # Mocked JIT loader and environment tests
 ```
 
 ## 🛠️ Installation & Build
@@ -99,6 +105,138 @@ python setup.py bdist_wheel
 # Install the generated wheel into your environment
 pip install dist/torch_blend-*.whl
 ```
+
+### 3. Lazy JIT Compilation
+
+Torch Blend first tries to import the prebuilt native extension. If it is not
+available, the first call to `ImageBlender.blend()` validates the local
+toolchain and compiles the extension through `torch.utils.cpp_extension.load()`.
+Importing `torch_blend` alone does not trigger compilation.
+
+JIT removes the manual `build_ext` command, but the machine still needs:
+
+- A CUDA-enabled PyTorch build.
+- A CUDA Toolkit with `nvcc` matching `torch.version.cuda`.
+- A compatible C++ compiler.
+- Ninja.
+- A visible CUDA GPU, or an explicit `TORCH_CUDA_ARCH_LIST`.
+- A writable extension cache directory.
+
+Configuration can be supplied from Python before the first blend call:
+
+```python
+from torch_blend import configure_jit, validate_jit_environment
+
+configure_jit(
+    verbose=True,
+    lock_timeout_seconds=30,
+    extensions_dir="~/.cache/torch_blend",
+    cuda_home="/path/to/cuda",
+)
+
+# Optional: validate early instead of waiting for the first blend call.
+environment = validate_jit_environment()
+print(environment)
+```
+
+When a GPU is visible, Torch Blend automatically detects all visible compute
+capabilities and configures `TORCH_CUDA_ARCH_LIST`. Manual architecture
+configuration is only required when compiling without a visible GPU.
+
+Equivalent environment variables are supported:
+
+```bash
+export TORCH_BLEND_DISABLE_JIT=0
+export TORCH_BLEND_FORCE_JIT=0
+export TORCH_BLEND_JIT_VERBOSE=1
+export TORCH_EXTENSIONS_DIR="$HOME/.cache/torch_blend"
+export CUDA_HOME="/path/to/cuda"
+# Optional when no GPU is visible:
+export TORCH_CUDA_ARCH_LIST="8.6"
+```
+
+Set `TORCH_BLEND_DISABLE_JIT=1` to require a prebuilt extension. If the binary
+is missing, Torch Blend reports the manual build command instead of compiling.
+If an existing binary fails with an ABI or undefined-symbol error, JIT fallback
+is intentionally not attempted; rebuild the binary explicitly.
+
+To explicitly test the JIT path even when a prebuilt `.so` exists, run:
+
+```bash
+conda activate torch_blend_env
+python scripts/test_jit_build.py
+```
+
+Optional overrides:
+
+```bash
+python scripts/test_jit_build.py \
+    --cuda-home "$CONDA_PREFIX" \
+    --extensions-dir "$HOME/.cache/torch_blend" \
+    --cuda-arch-list "8.6" \
+    --lock-timeout 30
+```
+
+The script forces JIT compilation, validates the environment, runs BCHW linear
+and screen smoke tests, and reports first-call versus cached-call timing. Unless
+`--cuda-arch-list` is supplied, it targets only the currently visible GPU
+architectures, even if the shell contains a broader `TORCH_CUDA_ARCH_LIST`.
+`TORCH_BLEND_FORCE_JIT=1` provides the same binary-bypass behavior for custom
+development scripts.
+
+Verbose mode prints the module name, build directory, architectures, and Ninja
+compiler output. PyTorch leaves a `lock` file behind when a build process is
+interrupted. Torch Blend waits for this lock for 30 seconds instead of waiting
+forever, then prints the exact stale lock path and a removal command. Remove it
+only after confirming that no other JIT build is running.
+
+The public JIT helpers are:
+
+- `configure_jit(...)`: configure paths, verbosity, lock timeout, architecture,
+  or disable JIT.
+- `build_jit_extension()`: force JIT compilation before the first blend call.
+- `clear_jit_cache(...)`: remove the cache for the current source version.
+- `detect_cuda_architectures()`: inspect targets for visible CUDA devices.
+- `get_jit_config()`: inspect the effective Python and environment configuration.
+- `validate_jit_environment()`: run toolchain checks before compilation.
+- `JITEnvironmentError`: validation failure with actionable installation guidance.
+
+JIT configuration becomes immutable once native extension loading starts.
+
+To compile before the first inference call:
+
+```python
+from torch_blend import build_jit_extension
+
+build_jit_extension()
+```
+
+To remove the cache for the current source version:
+
+```python
+from torch_blend import clear_jit_cache
+
+clear_jit_cache()
+```
+
+Cache deletion refuses to remove an existing build lock by default. Use
+`clear_jit_cache(force=True)` only after confirming no other process is building.
+The test script provides equivalent rebuild options:
+
+```bash
+python scripts/test_jit_build.py --rebuild
+
+# Use only for a confirmed stale lock:
+python scripts/test_jit_build.py --rebuild --force-clear-lock
+```
+
+PyTorch rejects CUDA major-version mismatches. Matching major versions with
+different minor versions are allowed with a warning, consistent with PyTorch's
+extension build behavior.
+
+The current package always compiles a CUDA extension, even when tensors are
+processed by the CPU backend. A CUDA toolkit is therefore still required to
+install or JIT-build from source; CPU-only packaging is not yet supported.
 
 ## 🧪 Running Tests
 

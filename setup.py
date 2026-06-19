@@ -1,10 +1,17 @@
-from setuptools import setup
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
     name="torch_blend",
     version="0.1.0",
-    packages=["torch_blend"],
+    description="PyTorch CPU/CUDA image blending extension",
+    python_requires=">=3.10",
+    packages=find_packages(),
+    package_data={
+        "torch_blend": ["ext/*.cpp", "ext/*.cu", "ext/*.h"],
+    },
+    include_package_data=True,
+    zip_safe=False,
     ext_modules=[
         CUDAExtension(
             name="torch_blend._torch_blend_cuda",
